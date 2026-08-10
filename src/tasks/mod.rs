@@ -17,9 +17,12 @@ use alloy::rpc::types::Filter;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing::{info, error};
 
 use crate::contracts::{Claim, Party};
+
+const RECEIPT_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn decode_revert_reason(err_msg: &str) -> Option<String> {
     let data_prefix = "data: \"0x";
@@ -117,7 +120,7 @@ pub async fn send_tx(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match result {
         Ok(pending) => {
-            let receipt = pending.get_receipt().await?;
+            let receipt = pending.with_timeout(Some(RECEIPT_TIMEOUT)).get_receipt().await?;
             if !receipt.status() {
                 return Err(format!("[{}] {} reverted", route_name, action).into());
             }

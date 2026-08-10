@@ -123,18 +123,10 @@ impl EventIndexer {
             Outbox => (&self.route.outbox_provider, self.route.outbox_address, "Outbox", &self.outbox_catchup),
         };
 
-        let current_block = match provider.get_block_number().await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(logger = "Indexer", route = self.route.name, chain = label, "Failed to get block number: {e}");
-                return false;
-            }
-        };
-
-        let current_block_data = match provider.get_block_by_number(current_block.into()).await {
+        let current_block_data = match provider.get_block_by_number(Default::default()).await {
             Ok(Some(b)) => b,
             Ok(None) => {
-                warn!(logger = "Indexer", route = self.route.name, chain = label, block = current_block, "Block not found");
+                warn!(logger = "Indexer", route = self.route.name, chain = label, "Latest block not found");
                 return false;
             }
             Err(e) => {
