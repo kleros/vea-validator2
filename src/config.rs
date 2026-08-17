@@ -2,96 +2,15 @@ use alloy::primitives::Address;
 use alloy::network::{EthereumWallet, Ethereum};
 use alloy::providers::{ProviderBuilder, DynProvider};
 use alloy::rpc::client::RpcClient;
-use alloy::rpc::json_rpc::{RequestPacket, ResponsePacket, ResponsePayload};
 use alloy::transports::http::Http;
 use alloy::transports::layers::FallbackLayer;
-use alloy::transports::{TransportError, TransportErrorKind, TransportFut};
 use std::num::NonZeroUsize;
 use std::str::FromStr;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use std::collections::HashMap;
-use tower::{Service, ServiceBuilder};
-use tracing::warn;
+use tower::ServiceBuilder;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Returns `true` for JSON-RPC error responses that indicate the endpoint itself is
-/// broken (misconfigured, unauthorized, rate-limited, overloaded) rather than an
-/// application-level error (e.g. a contract revert).
-///
-/// alloy's `FallbackLayer` only fails over on transport-level errors (connection
-/// refused, timeout, HTTP 5xx); a JSON-RPC error delivered over a valid HTTP 200
-/// response is otherwise treated as a "successful" call, so a misconfigured endpoint
-/// that responds quickly with an auth error can win the fallback race indefinitely
-/// and never gets scored down. `ErrorAwareTransport` below reclassifies these specific
-/// cases as transport errors so the fallback logic actually routes around them.
-fn is_infra_rpc_error(code: i64, message: &str) -> bool {
-    // -32000 ("server error") is deliberately excluded from this code-only match: it's a
-    // broad, provider-defined catch-all that some nodes also use for application-level
-    // reverts (with a `data` payload we must not discard). Its auth/rate-limit cases are
-    // still caught below via message text, which is unambiguous.
-    matches!(code, -32603 | -32005)
-        || message.contains("Unauthorized")
-        || message.contains("API key")
-        || message.contains("api key")
-        || message.contains("rate limit")
-        || message.contains("Too Many Requests")
-}
-
-/// Wraps an RPC transport so JSON-RPC responses matching [`is_infra_rpc_error`] are
-/// surfaced as transport errors instead of being passed through as a successful call.
-#[derive(Clone)]
-struct ErrorAwareTransport<S> {
-    inner: S,
-    label: String,
-}
-
-impl<S> Service<RequestPacket> for ErrorAwareTransport<S>
-where
-    S: Service<RequestPacket, Response = ResponsePacket, Error = TransportError, Future = TransportFut<'static>>
-        + Send
-        + Clone
-        + 'static,
-{
-    type Response = ResponsePacket;
-    type Error = TransportError;
-    type Future = TransportFut<'static>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, req: RequestPacket) -> Self::Future {
-        let label = self.label.clone();
-        let fut = self.inner.call(req);
-        Box::pin(async move {
-            let response = fut.await?;
-
-            let infra_error = match &response {
-                ResponsePacket::Single(r) => match &r.payload {
-                    ResponsePayload::Failure(e) if is_infra_rpc_error(e.code, &e.message) => {
-                        Some(format!("error code {}: {}", e.code, e.message))
-                    }
-                    _ => None,
-                },
-                ResponsePacket::Batch(rs) => rs.iter().find_map(|r| match &r.payload {
-                    ResponsePayload::Failure(e) if is_infra_rpc_error(e.code, &e.message) => {
-                        Some(format!("error code {}: {}", e.code, e.message))
-                    }
-                    _ => None,
-                }),
-            };
-
-            if let Some(msg) = infra_error {
-                warn!(logger = "Config", transport = label.as_str(), "RPC endpoint returned infra-level error, treating as unavailable for fallback purposes: {msg}");
-                return Err(TransportErrorKind::custom_str(&msg));
-            }
-
-            Ok(response)
-        })
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct ChainInfo {
@@ -148,24 +67,6 @@ pub struct ValidatorConfig {
     pub ethereum_provider: DynProvider<Ethereum>,
     pub make_claims: bool,
 }
-/// Strips path/query from an RPC URL so it's safe to log (RPC URLs commonly embed
-/// API keys in the path, e.g. `https://rpc.ankr.com/eth_sepolia/<key>`).
-fn redact_url(url: &str) -> String {
-    match url.split_once("://") {
-        Some((scheme, rest)) => {
-            // Secrets can appear in the path (`/eth_sepolia/<key>`), the query string
-            // (`?apikey=<key>`), or userinfo (`user:pass@host`) - strip all three.
-            let host_and_after = rest.split_once('@').map_or(rest, |(_, after)| after);
-            let host = host_and_after
-                .split(['/', '?', '#'])
-                .next()
-                .unwrap_or(host_and_after);
-            format!("{scheme}://{host}")
-        }
-        None => "unknown".to_string(),
-    }
-}
-
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -188,13 +89,10 @@ fn build_provider_from_urls(urls: &[String], wallet: &EthereumWallet) -> DynProv
     }
 
     let fallback = FallbackLayer::default()
-        .with_active_transport_count(NonZeroUsize::new(2).unwrap());
+        .with_active_transport_count(NonZeroUsize::new(3).unwrap());
 
     let transports: Vec<_> = urls.iter()
-        .map(|url| ErrorAwareTransport {
-            inner: Http::with_client(http_client.clone(), url.parse().expect("Invalid RPC URL")),
-            label: redact_url(url),
-        })
+        .map(|url| Http::with_client(http_client.clone(), url.parse().expect("Invalid RPC URL")))
         .collect();
 
     let transport = ServiceBuilder::new()
