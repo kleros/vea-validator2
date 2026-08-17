@@ -10,16 +10,6 @@ use crate::tasks::{ClaimStore, TaskStore};
 const BEFORE_EPOCH_BUFFER: u64 = 60;
 const AFTER_EPOCH_BUFFER: u64 = 20 * 60;
 
-fn is_transient_rpc_error(err: &str) -> bool {
-    err.contains("timed out")
-        || err.contains("not confirmed within the timeout")
-        || err.contains("connection")
-        || err.contains("error code -32603")
-        || err.contains("error code -32005")
-        || err.contains("HTTP error 429")
-        || err.contains("HTTP error 5")
-}
-
 pub struct EpochWatcher {
     config: ValidatorConfig,
     route: Route,
@@ -78,7 +68,7 @@ impl EpochWatcher {
                             Err(e) if e.to_string() == "EpochNotFinalized" => {
                                 skip_claim_until = now + 300;
                             }
-                            Err(e) if is_transient_rpc_error(&e.to_string()) => {
+                            Err(e) if e.to_string().contains("timed out") || e.to_string().contains("connection") => {
                             warn!(logger = "EpochWatcher", route = self.route.name, epoch = prev_epoch, "Claim RPC error: {e}, retrying next cycle");
                         }
                         Err(e) => panic!("[{}] FATAL: Failed to claim epoch {}: {}", self.route.name, prev_epoch, e),
