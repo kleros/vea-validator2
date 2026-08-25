@@ -3,12 +3,14 @@ use std::sync::{Arc, Mutex};
 use tracing::info;
 use crate::config::Route;
 use crate::contracts::IVeaOutbox;
-use crate::tasks::{send_tx, was_event_emitted, ClaimStore};
+use crate::tasks::{send_or_replace, was_event_emitted, ClaimStore, TaskStore};
 
 pub async fn execute(
     route: &Route,
     epoch: u64,
     claim_store: &Arc<Mutex<ClaimStore>>,
+    task_store: &Arc<Mutex<TaskStore>>,
+    wallet_address: Address,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let claim_data = claim_store.lock().unwrap().get(epoch);
     if claim_data.challenger != Address::ZERO {
@@ -18,13 +20,22 @@ pub async fn execute(
 
     let claim = claim_store.lock().unwrap().get_claim(epoch);
     let outbox = IVeaOutbox::new(route.outbox_address, route.outbox_provider.clone());
-    let result = send_tx(
-        outbox.startVerification(U256::from(epoch), claim).send().await,
+    let result = send_or_replace(
+        outbox.startVerification(U256::from(epoch), claim),
+        &route.outbox_provider,
+        wallet_address,
+        task_store,
+        epoch,
         "startVerification",
         route.name,
     ).await;
 
     if let Err(e) = result {
+        // Still in flight - not a failure, so don't fall through to the "someone else
+        // did it" checks, which would misread an unconfirmed tx as a lost race.
+        if e.to_string() == "PendingReplacement" {
+            return Err(e);
+        }
         if was_event_emitted(&route.outbox_provider, route.outbox_address, "VerificationStarted(uint256)", epoch).await {
             info!(logger = "StartVerification", route = route.name, epoch, "Already started by another validator");
             return Ok(());

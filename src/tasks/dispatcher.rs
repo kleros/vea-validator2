@@ -78,12 +78,20 @@ impl TaskDispatcher {
 
     async fn execute_task(&self, task: &Task, current_timestamp: u64) -> bool {
         let epoch = task.epoch;
+        let wallet_address = self.config.wallet.default_signer().address();
         match &task.kind {
             TaskKind::SaveSnapshot => {
                 tasks::save_snapshot::execute(&self.route, &self.task_store).await.is_ok()
             }
             TaskKind::Claim { .. } => {
-                tasks::claim::execute(&self.config, &self.route, epoch, &self.claim_store, current_timestamp).await.is_ok()
+                tasks::claim::execute(
+                    &self.config,
+                    &self.route,
+                    epoch,
+                    &self.claim_store,
+                    current_timestamp,
+                    &self.task_store,
+                ).await.is_ok()
             }
             TaskKind::ValidateClaim => {
                 match tasks::validate_claim::execute(
@@ -103,8 +111,10 @@ impl TaskDispatcher {
                 }
             }
             TaskKind::Challenge => {
-                match tasks::challenge::execute(&self.config, &self.route, epoch, &self.claim_store).await {
+                match tasks::challenge::execute(&self.config, &self.route, epoch, &self.claim_store, &self.task_store).await {
                     Ok(_) => true,
+                    // In flight: keep the task as-is so the next cycle replaces it.
+                    Err(e) if e.to_string() == "PendingReplacement" => false,
                     Err(e) if e.to_string() == "Insufficient funds" => {
                         self.task_store.lock().unwrap().reschedule_task(task, current_timestamp + 30 * 60);
                         true
@@ -124,8 +134,9 @@ impl TaskDispatcher {
                 tasks::send_snapshot::execute(&self.route, epoch, &self.claim_store).await.is_ok()
             }
             TaskKind::StartVerification => {
-                match tasks::start_verification::execute(&self.route, epoch, &self.claim_store).await {
+                match tasks::start_verification::execute(&self.route, epoch, &self.claim_store, &self.task_store, wallet_address).await {
                     Ok(_) => true,
+                    Err(e) if e.to_string() == "PendingReplacement" => false,
                     Err(e) if e.to_string().contains("Invalid claim") => {
                         self.task_store.lock().unwrap().reschedule_task(task, current_timestamp + 30 * 60);
                         true
@@ -134,8 +145,9 @@ impl TaskDispatcher {
                 }
             }
             TaskKind::VerifySnapshot => {
-                match tasks::verify_snapshot::execute(&self.route, epoch, &self.claim_store).await {
+                match tasks::verify_snapshot::execute(&self.route, epoch, &self.claim_store, &self.task_store, wallet_address).await {
                     Ok(_) => true,
+                    Err(e) if e.to_string() == "PendingReplacement" => false,
                     Err(e) if e.to_string().contains("Invalid claim") => {
                         self.task_store.lock().unwrap().reschedule_task(task, current_timestamp + 30 * 60);
                         true
@@ -155,8 +167,13 @@ impl TaskDispatcher {
                     *l2_timestamp,
                     *amount,
                     data.clone(),
+                    &self.task_store,
+                    epoch,
                 ).await {
                     Ok(_) => true,
+                    // Must precede the catch-all below, or an in-flight relay gets
+                    // pushed 30 minutes into the future instead of being replaced.
+                    Err(e) if e.to_string() == "PendingReplacement" => false,
                     Err(e) if e.to_string() == "RootNotConfirmed" => {
                         self.task_store.lock().unwrap().reschedule_task(task, current_timestamp + 60 * 60);
                         true
