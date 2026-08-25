@@ -10,7 +10,7 @@ use tracing::{info, warn, error};
 use crate::config::Route;
 use crate::contracts::{IVeaInbox, IArbSys};
 use crate::tasks::{Task, TaskKind, TaskStore, ClaimStore, ClaimData};
-use crate::find_block_by_timestamp;
+use crate::{find_block_by_timestamp, find_block_by_timestamp_from};
 
 use alloy::network::Ethereum;
 use alloy::providers::DynProvider;
@@ -143,17 +143,21 @@ impl EventIndexer {
         };
 
         let (catchup_start, catchup_target, last_logged_pct) = catchup;
-        let mut target_block = catchup_target.load(Ordering::Relaxed);
+        // The last target doubles as the lower bound for the next search: the target
+        // timestamp only moves forward, so the answer can never fall below it.
+        let previous_target = catchup_target.load(Ordering::Relaxed);
+        let mut target_block = previous_target;
 
         if target_block == 0 || from_block >= target_block {
             let target_ts = now.saturating_sub(FINALITY_BUFFER_SECS);
-            target_block = find_block_by_timestamp(provider, target_ts).await;
+            target_block = find_block_by_timestamp_from(provider, target_ts, previous_target).await;
             catchup_target.store(target_block, Ordering::Relaxed);
         }
 
         if from_block >= target_block {
             catchup_start.store(0, Ordering::Relaxed);
-            catchup_target.store(0, Ordering::Relaxed);
+            // `catchup_target` is deliberately kept: zeroing it here is what forced the
+            // next idle cycle to re-search the chain from block 0.
             last_logged_pct.store(0, Ordering::Relaxed);
             return true;
         }
