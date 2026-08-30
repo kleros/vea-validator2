@@ -4,7 +4,7 @@ use tracing::{info, warn};
 use crate::config::{Route, ValidatorConfig};
 use crate::contracts::{IVeaInbox, IVeaOutbox, IVeaOutboxArbToEth, IVeaOutboxArbToGnosis};
 use crate::finality::is_epoch_finalized;
-use crate::tasks::{send_tx, ClaimStore};
+use crate::tasks::{send_or_replace, ClaimStore, TaskStore};
 
 const SEVEN_DAYS_SECS: u32 = 7 * 24 * 3600;
 
@@ -14,6 +14,7 @@ pub async fn execute(
     epoch: u64,
     claim_store: &Arc<Mutex<ClaimStore>>,
     current_timestamp: u64,
+    task_store: &Arc<Mutex<TaskStore>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let inbox = IVeaInbox::new(route.inbox_address, route.inbox_provider.clone());
     let epoch_period: u64 = inbox.epochPeriod().call().await?.try_into()?;
@@ -56,24 +57,38 @@ pub async fn execute(
         return Ok(());
     }
 
+    let wallet_address = config.wallet.default_signer().address();
     let result = if route.weth_address.is_some() {
-        let outbox = IVeaOutboxArbToGnosis::new(route.outbox_address, route.outbox_provider.clone());
-        send_tx(
-            outbox.claim(U256::from(epoch), state_root).send().await,
+        let gnosis_outbox = IVeaOutboxArbToGnosis::new(route.outbox_address, route.outbox_provider.clone());
+        send_or_replace(
+            gnosis_outbox.claim(U256::from(epoch), state_root),
+            &route.outbox_provider,
+            wallet_address,
+            task_store,
+            epoch,
             "claim",
             route.name,
         ).await
     } else {
-        let outbox = IVeaOutboxArbToEth::new(route.outbox_address, route.outbox_provider.clone());
-        let deposit = outbox.deposit().call().await?;
-        send_tx(
-            outbox.claim(U256::from(epoch), state_root).value(deposit).send().await,
+        let eth_outbox = IVeaOutboxArbToEth::new(route.outbox_address, route.outbox_provider.clone());
+        let deposit = eth_outbox.deposit().call().await?;
+        send_or_replace(
+            eth_outbox.claim(U256::from(epoch), state_root).value(deposit),
+            &route.outbox_provider,
+            wallet_address,
+            task_store,
+            epoch,
             "claim",
             route.name,
         ).await
     };
 
     if let Err(e) = result {
+        // Still in flight - not a failed claim, so don't consult the chain or the
+        // caller will read "not claimed yet" and treat it as something to retry fresh.
+        if e.to_string() == "PendingReplacement" {
+            return Err(e);
+        }
         let claim_hash = outbox.claimHashes(U256::from(epoch)).call().await?;
         if claim_hash != FixedBytes::<32>::ZERO {
             info!(logger = "Claim", route = route.name, epoch, "Already claimed by another validator");

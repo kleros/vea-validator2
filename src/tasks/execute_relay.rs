@@ -1,8 +1,9 @@
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
+use std::sync::{Arc, Mutex};
 use tracing::{info, error};
 use crate::config::{Route, ValidatorConfig};
 use crate::contracts::{IArbSys, INodeInterface, IOutbox};
-use crate::tasks::send_tx;
+use crate::tasks::{send_or_replace, TaskStore};
 
 const ARB_SYS: Address = Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64]);
 const NODE_INTERFACE: Address = Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xC8]);
@@ -18,6 +19,8 @@ pub async fn execute(
     l2_timestamp: u64,
     amount: U256,
     data: Bytes,
+    task_store: &Arc<Mutex<TaskStore>>,
+    epoch: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let outbox = IOutbox::new(config.arb_outbox, config.ethereum_provider.clone());
 
@@ -35,7 +38,7 @@ pub async fn execute(
         return Err("RootNotConfirmed".into());
     }
 
-    let result = send_tx(
+    let result = send_or_replace(
         outbox.executeTransaction(
             proof,
             position,
@@ -46,12 +49,19 @@ pub async fn execute(
             U256::from(l2_timestamp),
             amount,
             data,
-        ).send().await,
+        ),
+        &config.ethereum_provider,
+        config.wallet.default_signer().address(),
+        task_store,
+        epoch,
         "executeTransaction",
         route.name,
     ).await;
 
     if let Err(e) = &result {
+        if e.to_string() == "PendingReplacement" {
+            return result;
+        }
         error!(logger = "ExecuteRelay", route = route.name, "Execution failed: {e}");
         return Err("ExecutionFailed".into());
     }

@@ -15,11 +15,14 @@ use alloy::network::Ethereum;
 use alloy::providers::{DynProvider, PendingTransactionBuilder, Provider};
 use alloy::rpc::types::Filter;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use tracing::{info, error};
+use std::sync::{Arc, Mutex};
+use tracing::{info, warn, error};
 
 use crate::contracts::{Claim, Party};
+use crate::RECEIPT_TIMEOUT;
 
 fn decode_revert_reason(err_msg: &str) -> Option<String> {
     let data_prefix = "data: \"0x";
@@ -110,6 +113,125 @@ pub async fn was_event_emitted(
     }
 }
 
+/// The lowest nonce this account has broadcast but not had confirmed, if any.
+///
+/// A fee bump only helps the transaction sitting at this nonce; anything numbered
+/// above it cannot be mined until that one clears, so bumping those overpays without
+/// unblocking anything.
+///
+/// Approximate by nature - mempool contents are node-local and `FallbackService` races
+/// several transports - so this is used only to avoid pointless bumps, never as the
+/// safety mechanism. Preventing a duplicate send is the pinned nonce's job, and that
+/// never consults the mempool.
+pub async fn blocking_nonce(provider: &DynProvider<Ethereum>, address: Address) -> Option<u64> {
+    let confirmed = provider.get_transaction_count(address).latest().await.ok()?;
+    let pending = provider.get_transaction_count(address).pending().await.ok()?;
+    (pending > confirmed).then_some(confirmed)
+}
+
+/// Send `call`, or replace this task's in-flight transaction with a fee-bumped one at
+/// the same nonce.
+///
+/// The nonce is pinned on every send, not just replacements. Pinning bypasses alloy's
+/// `NonceFiller` (its `status()` returns `Finished` once a nonce is set), which is
+/// correct for a replacement - it reuses a slot rather than claiming a new one - and
+/// on a first send it means the nonce is known *before* broadcasting. Reading it back
+/// afterwards would be unreliable: a node that has not yet seen the transaction answers
+/// null, and losing the nonce would let the next cycle send a duplicate, which is the
+/// exact failure this function exists to prevent.
+pub async fn send_or_replace<P, D>(
+    call: alloy::contract::CallBuilder<P, D, Ethereum>,
+    provider: &DynProvider<Ethereum>,
+    wallet_address: Address,
+    task_store: &Arc<Mutex<TaskStore>>,
+    epoch: u64,
+    action: &str,
+    route_name: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    P: Provider<Ethereum>,
+    D: alloy::contract::CallDecoder,
+{
+    let key = pending_key(action, epoch);
+    let market = provider.estimate_eip1559_fees().await?;
+
+    // Bound to a local so the `MutexGuard` is dropped here rather than being held
+    // across the awaits below, which would make this future non-`Send`.
+    let existing = task_store.lock().unwrap().get_pending_tx(&key);
+
+    let (nonce, max_fee, priority_fee) = match existing {
+        Some(previous) => {
+            let nonce = previous.nonce;
+            if let Some(blocking) = blocking_nonce(provider, wallet_address).await {
+                if blocking != nonce {
+                    info!(logger = "Task", route = route_name, action, nonce, blocking, "Queued behind an earlier nonce, waiting");
+                    return Err("PendingReplacement".into());
+                }
+            }
+            match (
+                crate::bumped_fee(previous.max_fee, market.max_fee_per_gas),
+                crate::bumped_fee(previous.priority_fee, market.max_priority_fee_per_gas),
+            ) {
+                (Some(max_fee), Some(priority_fee)) => {
+                    info!(logger = "Task", route = route_name, action, nonce, max_fee, "Replacing pending tx with a higher fee");
+                    (nonce, max_fee, priority_fee)
+                }
+                _ => {
+                    warn!(logger = "Task", route = route_name, action, nonce, "Fee ceiling reached, holding rather than bumping further");
+                    return Err("PendingReplacement".into());
+                }
+            }
+        }
+        None => {
+            let nonce = provider.get_transaction_count(wallet_address).pending().await?;
+            (nonce, market.max_fee_per_gas, market.max_priority_fee_per_gas)
+        }
+    };
+
+    task_store.lock().unwrap().set_pending_tx(&key, nonce, max_fee, priority_fee);
+
+    let sent = call
+        .nonce(nonce)
+        .max_fee_per_gas(max_fee)
+        .max_priority_fee_per_gas(priority_fee)
+        .send()
+        .await;
+
+    let pending = match sent {
+        Ok(pending) => pending,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("nonce too low") {
+                info!(logger = "Task", route = route_name, action, nonce, "Nonce already consumed, deferring to on-chain checks");
+                task_store.lock().unwrap().clear_pending_tx(&key);
+                return Err("NonceConsumed".into());
+            }
+            if msg.contains("replacement transaction underpriced") {
+                warn!(logger = "Task", route = route_name, action, nonce, "Replacement underpriced, bumping further next cycle");
+                return Err("PendingReplacement".into());
+            }
+            // Anything else may or may not have reached a mempool, so the record stays:
+            // a stale one is harmless, a lost one risks a duplicate.
+            return send_tx(Err(e), action, route_name).await;
+        }
+    };
+
+    match pending.with_timeout(Some(RECEIPT_TIMEOUT)).get_receipt().await {
+        Ok(receipt) => {
+            task_store.lock().unwrap().clear_pending_tx(&key);
+            if !receipt.status() {
+                return Err(format!("[{}] {} reverted", route_name, action).into());
+            }
+            info!(logger = "Task", route = route_name, action, "Transaction succeeded");
+            Ok(())
+        }
+        Err(e) => {
+            warn!(logger = "Task", route = route_name, action, nonce, "Receipt not seen ({e}), will replace next cycle");
+            Err("PendingReplacement".into())
+        }
+    }
+}
+
 pub async fn send_tx(
     result: Result<PendingTransactionBuilder<Ethereum>, ContractError>,
     action: &str,
@@ -117,7 +239,7 @@ pub async fn send_tx(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match result {
         Ok(pending) => {
-            let receipt = pending.get_receipt().await?;
+            let receipt = pending.with_timeout(Some(RECEIPT_TIMEOUT)).get_receipt().await?;
             if !receipt.status() {
                 return Err(format!("[{}] {} reverted", route_name, action).into());
             }
@@ -142,6 +264,23 @@ pub struct Task {
     pub epoch: u64,
     pub execute_after: u64,
     pub kind: TaskKind,
+}
+
+/// A transaction that has been broadcast but not yet seen confirmed.
+///
+/// Tracked per route in [`RouteState`] rather than on a [`Task`], because the claim
+/// that `EpochWatcher` files has no `Task` behind it, and because a task can be
+/// removed by `invalidate_tasks` while its transaction is still in flight.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingTx {
+    pub nonce: u64,
+    pub max_fee: u128,
+    pub priority_fee: u128,
+}
+
+/// Key for [`RouteState::pending_txs`] - one in-flight transaction per action per epoch.
+pub fn pending_key(action: &str, epoch: u64) -> String {
+    format!("{action}:{epoch}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +334,10 @@ pub struct RouteState {
     #[serde(default)]
     pub on_sync: bool,
     pub last_saved_count: Option<u64>,
+    /// In-flight transactions, keyed by [`pending_key`]. Survives task removal, and
+    /// covers actions that have no `Task` at all.
+    #[serde(default)]
+    pub pending_txs: HashMap<String, PendingTx>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,6 +499,29 @@ impl TaskStore {
             }
         }
         self.save(&state);
+    }
+
+    /// Record the nonce and fees a transaction went out with.
+    ///
+    /// Written before the transaction is broadcast, so the record cannot be lost by a
+    /// crash between broadcasting and persisting. A send that is then rejected outright
+    /// leaves a harmless stale record: the next attempt simply sends at that nonce.
+    pub fn set_pending_tx(&self, key: &str, nonce: u64, max_fee: u128, priority_fee: u128) {
+        info!(logger = "TaskStore", route = self.label().as_str(), key, nonce, "Recording pending tx");
+        let mut state = self.load();
+        state.pending_txs.insert(key.to_string(), PendingTx { nonce, max_fee, priority_fee });
+        self.save(&state);
+    }
+
+    /// Forget a pending transaction, once its outcome is known.
+    pub fn clear_pending_tx(&self, key: &str) {
+        let mut state = self.load();
+        state.pending_txs.remove(key);
+        self.save(&state);
+    }
+
+    pub fn get_pending_tx(&self, key: &str) -> Option<PendingTx> {
+        self.load().pending_txs.get(key).cloned()
     }
 
     pub fn update_inbox_block(&self, block: u64) {

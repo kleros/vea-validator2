@@ -4,6 +4,7 @@ use alloy::network::Ethereum;
 use tracing::info;
 use crate::contracts::{IVeaOutbox, IWETH, IOutbox, IRollup};
 use crate::config::{ValidatorConfig, Route, RouteSettings};
+use crate::RECEIPT_TIMEOUT;
 
 pub fn check_finality_config(config: &ValidatorConfig) {
     if config.sequencer_inbox.is_none() {
@@ -21,14 +22,14 @@ pub async fn check_rpc_health(routes: &[Route]) -> Result<(), Box<dyn std::error
     let eth_provider = &routes[0].outbox_provider;
     let gnosis_provider = &routes[1].outbox_provider;
 
-    let arb_block = arb_provider.get_block_number().await
-        .map_err(|e| panic!("FATAL: Arbitrum RPC unreachable or unhealthy: {}", e))?;
+    let arb_block = crate::retry_rpc("check Arbitrum RPC health", || async { arb_provider.get_block_number().await }).await
+        .map_err(|e| format!("FATAL: Arbitrum RPC unreachable or unhealthy: {e}"))?;
     info!(logger = "Startup", chain = "Arbitrum", block = arb_block, "RPC healthy");
-    let eth_block = eth_provider.get_block_number().await
-        .map_err(|e| panic!("FATAL: Ethereum RPC unreachable or unhealthy: {}", e))?;
+    let eth_block = crate::retry_rpc("check Ethereum RPC health", || async { eth_provider.get_block_number().await }).await
+        .map_err(|e| format!("FATAL: Ethereum RPC unreachable or unhealthy: {e}"))?;
     info!(logger = "Startup", chain = "Ethereum", block = eth_block, "RPC healthy");
-    let gnosis_block = gnosis_provider.get_block_number().await
-        .map_err(|e| panic!("FATAL: Gnosis RPC unreachable or unhealthy: {}", e))?;
+    let gnosis_block = crate::retry_rpc("check Gnosis RPC health", || async { gnosis_provider.get_block_number().await }).await
+        .map_err(|e| format!("FATAL: Gnosis RPC unreachable or unhealthy: {e}"))?;
     info!(logger = "Startup", chain = "Gnosis", block = gnosis_block, "RPC healthy");
     Ok(())
 }
@@ -79,7 +80,7 @@ pub async fn ensure_weth_approval(c: &ValidatorConfig, gnosis_provider: DynProvi
         let max_approval = U256::MAX;
         let approve_tx = weth.approve(c.outbox_arb_to_gnosis, max_approval);
         let pending = approve_tx.send().await?;
-        let receipt = pending.get_receipt().await?;
+        let receipt = pending.with_timeout(Some(RECEIPT_TIMEOUT)).get_receipt().await?;
 
         if !receipt.status() {
             panic!("FATAL: WETH approval transaction failed");
@@ -93,18 +94,25 @@ pub async fn ensure_weth_approval(c: &ValidatorConfig, gnosis_provider: DynProvi
     Ok(())
 }
 
+/// How far back to sample when measuring average block time. On chains shorter
+/// than this the lookback is clamped to genesis and the divisor follows the
+/// actual block delta, so the average stays correct instead of being skewed.
+const BLOCK_TIME_SAMPLE_BLOCKS: u64 = 10_000;
+
 async fn get_avg_block_time_ms(provider: &DynProvider<Ethereum>) -> u64 {
-    let latest = provider.get_block_number().await
-        .expect("Failed to get latest block number");
-    let latest_block = provider.get_block_by_number(latest.into()).await
-        .expect("Failed to get latest block")
+    let latest_block = crate::retry_rpc_opt("get latest block", || async { provider.get_block_by_number(Default::default()).await }).await
+        .unwrap_or_else(|e| panic!("Failed to get latest block: {e}"))
         .expect("Latest block not found");
-    let old_block = provider.get_block_by_number((latest - 10000).into()).await
-        .expect("Failed to get old block")
+    let latest = latest_block.header.number;
+    let old = latest.saturating_sub(BLOCK_TIME_SAMPLE_BLOCKS);
+    let old_block = crate::retry_rpc_opt("get old block", || async { provider.get_block_by_number(old.into()).await }).await
+        .unwrap_or_else(|e| panic!("Failed to get old block: {e}"))
         .expect("Old block not found");
 
-    let time_diff = latest_block.header.timestamp - old_block.header.timestamp;
-    (time_diff * 1000) / 10000
+    // `.max(1)` guards a genesis-only chain (latest == 0), where the delta is zero.
+    let block_delta = latest.saturating_sub(old).max(1);
+    let time_diff = latest_block.header.timestamp.saturating_sub(old_block.header.timestamp);
+    (time_diff * 1000) / block_delta
 }
 
 pub async fn load_route_settings(
@@ -118,18 +126,16 @@ pub async fn load_route_settings(
     info!(logger = "Startup", route = route.name, avg_block_time_ms, "Block time computed");
 
     let arb_outbox = IOutbox::new(arb_outbox_address, arb_outbox_provider.clone());
-    let rollup_address = arb_outbox.rollup().call().await
-        .expect("Failed to get rollup address from Arbitrum outbox");
+    let rollup_address = crate::retry_rpc_or_panic("get rollup address from Arbitrum outbox", || async { arb_outbox.rollup().call().await }).await;
     let rollup = IRollup::new(rollup_address, arb_outbox_provider.clone());
-    let confirm_period_blocks: u64 = rollup.confirmPeriodBlocks().call().await
-        .expect("Failed to get confirmPeriodBlocks")
+    let confirm_period_blocks: u64 = crate::retry_rpc_or_panic("get confirmPeriodBlocks", || async { rollup.confirmPeriodBlocks().call().await }).await
         .max(14458);
     info!(logger = "Startup", route = route.name, confirm_period_blocks, "Rollup config loaded");
 
     let outbox = IVeaOutbox::new(route.outbox_address, route.outbox_provider.clone());
-    let sequencer_delay_limit = outbox.sequencerDelayLimit().call().await.expect("Failed to get sequencerDelayLimit").to::<u64>();
-    let min_challenge_period = outbox.minChallengePeriod().call().await.expect("Failed to get minChallengePeriod").to::<u64>();
-    let epoch_period = outbox.epochPeriod().call().await.expect("Failed to get epochPeriod").to::<u64>();
+    let sequencer_delay_limit = crate::retry_rpc_or_panic("get sequencerDelayLimit", || async { outbox.sequencerDelayLimit().call().await }).await.to::<u64>();
+    let min_challenge_period = crate::retry_rpc_or_panic("get minChallengePeriod", || async { outbox.minChallengePeriod().call().await }).await.to::<u64>();
+    let epoch_period = crate::retry_rpc_or_panic("get epochPeriod", || async { outbox.epochPeriod().call().await }).await.to::<u64>();
     info!(logger = "Startup", route = route.name, sequencer_delay_limit, epoch_period, min_challenge_period, "Outbox params loaded");
 
     let relay_delay_secs = (confirm_period_blocks * avg_block_time_ms / 1000) + TIMING_SAFETY_BUFFER_SECS;

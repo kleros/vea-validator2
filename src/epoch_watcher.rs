@@ -63,8 +63,17 @@ impl EpochWatcher {
                     let prev_epoch = current_epoch - 1;
                     if last_after_epoch != Some(prev_epoch) {
                         info!(logger = "EpochWatcher", route = self.route.name, epoch = prev_epoch, "Checking claim");
-                        match tasks::claim::execute(&self.config, &self.route, prev_epoch, &self.claim_store, now).await {
+                        match tasks::claim::execute(&self.config, &self.route, prev_epoch, &self.claim_store, now, &self.task_store).await {
                             Ok(()) => { last_after_epoch = Some(prev_epoch); }
+                            Err(e) if e.to_string() == "PendingReplacement" => {
+                                info!(logger = "EpochWatcher", route = self.route.name, epoch = prev_epoch, "Claim tx still in flight, will replace next cycle");
+                            }
+                            // The nonce we held was consumed by something else, and the
+                            // claim did not land. The pending record is already cleared,
+                            // so the next cycle sends fresh - not a reason to kill the route.
+                            Err(e) if e.to_string() == "NonceConsumed" => {
+                                warn!(logger = "EpochWatcher", route = self.route.name, epoch = prev_epoch, "Claim nonce was consumed elsewhere, retrying next cycle");
+                            }
                             Err(e) if e.to_string() == "EpochNotFinalized" => {
                                 skip_claim_until = now + 300;
                             }

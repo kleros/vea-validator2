@@ -153,7 +153,8 @@ async fn test_claim_race_condition() {
 
     let test_dir = tempfile::tempdir().unwrap();
     let claim_store = Arc::new(Mutex::new(ClaimStore::new(test_dir.path().join("claims.json"))));
+    let task_store = Arc::new(Mutex::new(vea_validator::tasks::TaskStore::new(test_dir.path().join("sched.json"))));
     let ts = outbox_provider.get_block_by_number(Default::default()).await.unwrap().unwrap().header.timestamp;
-    let result = vea_validator::tasks::claim::execute(&c, route, epoch, &claim_store, ts).await;
+    let result = vea_validator::tasks::claim::execute(&c, route, epoch, &claim_store, ts, &task_store).await;
     assert!(result.is_ok(), "Validator should handle existing claim gracefully");
 }

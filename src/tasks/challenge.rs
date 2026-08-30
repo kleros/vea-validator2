@@ -5,13 +5,14 @@ use tracing::{info, warn, error};
 use crate::config::{Route, ValidatorConfig};
 use crate::contracts::{IVeaInbox, IVeaOutboxArbToEth, IVeaOutboxArbToGnosis, IWETH};
 use crate::finality::is_epoch_finalized;
-use crate::tasks::{send_tx, was_event_emitted, ClaimStore};
+use crate::tasks::{send_or_replace, was_event_emitted, ClaimStore, TaskStore};
 
 pub async fn execute(
     config: &ValidatorConfig,
     route: &Route,
     epoch: u64,
     claim_store: &Arc<Mutex<ClaimStore>>,
+    task_store: &Arc<Mutex<TaskStore>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let inbox = IVeaInbox::new(route.inbox_address, route.inbox_provider.clone());
     let epoch_period: u64 = inbox.epochPeriod().call().await?.try_into()?;
@@ -42,8 +43,12 @@ pub async fn execute(
             return Err("Insufficient funds".into());
         }
 
-        send_tx(
-            outbox.challenge(U256::from(epoch), claim).send().await,
+        send_or_replace(
+            outbox.challenge(U256::from(epoch), claim),
+            &route.outbox_provider,
+            wallet_address,
+            task_store,
+            epoch,
             "challenge",
             route.name,
         ).await
@@ -57,14 +62,21 @@ pub async fn execute(
             return Err("Insufficient funds".into());
         }
 
-        send_tx(
-            outbox.challenge(U256::from(epoch), claim).value(deposit).send().await,
+        send_or_replace(
+            outbox.challenge(U256::from(epoch), claim).value(deposit),
+            &route.outbox_provider,
+            wallet_address,
+            task_store,
+            epoch,
             "challenge",
             route.name,
         ).await
     };
 
     if let Err(e) = result {
+        if e.to_string() == "PendingReplacement" {
+            return Err(e);
+        }
         if was_event_emitted(&route.outbox_provider, route.outbox_address, "Challenged(uint256,address)", epoch).await {
             info!(logger = "Challenge", route = route.name, epoch, "Already challenged by another validator");
             return Ok(());
