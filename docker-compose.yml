@@ -1,0 +1,21 @@
+# vea-validator docker-compose
+# Usage: docker compose up -d
+# The image is pulled from GitHub Container Registry:
+#   ghcr.io/kleros/vea-validator2:latest
+# or a specific version tag:
+#   ghcr.io/kleros/vea-validator2:v0.1.0
+# or a specific commit sha:
+#   ghcr.io/kleros/vea-validator2:sha-abc123
+
+services:
+  vea-validator:
+    # For production it is preferred to use a specific tag/sha version instead of latest
+    image: ghcr.io/kleros/vea-validator2:latest
+    container_name: vea-validator
+    # Compose strips the `export ` prefixes used in .env, so it can be passed as-is.
+    env_file:
+      - .env
+    # The binary writes sync state to data/ relative to WORKDIR /app.
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
