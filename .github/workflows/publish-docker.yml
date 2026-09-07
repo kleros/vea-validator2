@@ -8,11 +8,13 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -32,7 +34,7 @@ jobs:
             org.opencontainers.image.title=vea-validator
             org.opencontainers.image.description=Validator bot for the Vea cross-chain bridge: monitors claims, challenges fraud, advances verification, and relays messages
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.license=MIT
+            org.opencontainers.image.licenses=MIT
           tags: |
             type=raw,value=latest
             type=semver,pattern={{version}}
