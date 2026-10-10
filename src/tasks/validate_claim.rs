@@ -1,9 +1,8 @@
-use alloy::primitives::U256;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn, error};
 use crate::config::{Route, ValidatorConfig};
 use crate::contracts::IVeaInbox;
-use crate::finality::is_epoch_finalized;
+use crate::finality::{final_snapshot, is_epoch_finalized};
 use crate::tasks::{Task, TaskKind, TaskStore, ClaimStore};
 
 pub async fn execute(
@@ -38,7 +37,13 @@ pub async fn execute(
     let claim_data = claim_store.lock().unwrap().get(epoch);
     let claimed_state_root = claim_data.state_root;
 
-    let correct_state_root = inbox.snapshots(U256::from(epoch)).call().await?;
+    let correct_state_root = match final_snapshot(&route.inbox_provider, route.inbox_address, epoch, epoch_period).await? {
+        Some(root) => root,
+        None => {
+            warn!(logger = "ValidateClaim", route = route.name, epoch, "Inbox RPC has not reached the epoch end yet");
+            return Err("EpochNotFinalized".into());
+        }
+    };
 
     if claimed_state_root == correct_state_root {
         info!(logger = "ValidateClaim", route = route.name, epoch, "VALID");

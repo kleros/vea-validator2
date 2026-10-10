@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 use crate::config::{Route, ValidatorConfig};
 use crate::contracts::{IVeaInbox, IVeaOutbox, IVeaOutboxArbToEth, IVeaOutboxArbToGnosis};
-use crate::finality::is_epoch_finalized;
+use crate::finality::{final_snapshot, is_epoch_finalized};
 use crate::tasks::{send_or_replace, ClaimStore, TaskStore};
 
 const SEVEN_DAYS_SECS: u32 = 7 * 24 * 3600;
@@ -33,7 +33,13 @@ pub async fn execute(
 
     let outbox = IVeaOutbox::new(route.outbox_address, route.outbox_provider.clone());
 
-    let state_root = inbox.snapshots(U256::from(epoch)).call().await?;
+    let state_root = match final_snapshot(&route.inbox_provider, route.inbox_address, epoch, epoch_period).await? {
+        Some(root) => root,
+        None => {
+            warn!(logger = "Claim", route = route.name, epoch, "Inbox RPC has not reached the epoch end yet");
+            return Err("EpochNotFinalized".into());
+        }
+    };
     if state_root == FixedBytes::<32>::ZERO {
         info!(logger = "Claim", route = route.name, epoch, "No snapshot");
         return Ok(());

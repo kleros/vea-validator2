@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{error, info};
 use crate::config::Route;
 use crate::contracts::{IVeaInbox, IVeaOutbox};
+use crate::finality::final_snapshot;
 use crate::tasks::{send_or_replace, was_event_emitted, ClaimStore, TaskStore};
 
 /// A claim may only be verified when it matches the inbox snapshot. A zero inbox
@@ -25,13 +26,17 @@ pub async fn execute(
     }
 
     let inbox = IVeaInbox::new(route.inbox_address, route.inbox_provider.clone());
-    let inbox_root = match crate::retry_rpc("read inbox snapshot", || async {
-        inbox.snapshots(U256::from(epoch)).call().await
-    }).await {
-        Ok(root) => root,
+    let epoch_period: u64 = inbox.epochPeriod().call().await?.try_into()?;
+    // A stale read would drop the task for an honest claim, so it must be final (S8).
+    let inbox_root = match final_snapshot(&route.inbox_provider, route.inbox_address, epoch, epoch_period).await {
+        Ok(Some(root)) => root,
+        Ok(None) => {
+            error!(logger = "VerifySnapshot", route = route.name, epoch, "Inbox RPC has not reached the epoch end yet");
+            return Err("EpochNotFinalized".into());
+        }
         Err(e) => {
             error!(logger = "VerifySnapshot", route = route.name, epoch, "Failed to read inbox snapshot: {e}");
-            return Err(e.into());
+            return Err(e);
         }
     };
     if !should_verify(claim_data.state_root, inbox_root) {

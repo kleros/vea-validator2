@@ -485,3 +485,86 @@ async fn test_s7_resync_does_not_resend_snapshot_for_resolved_dispute() {
     let left: Vec<_> = ts_b.lock().unwrap().load().tasks.into_iter().filter(|t| t.epoch == epoch).map(|t| t.kind.name()).collect();
     assert!(!left.contains(&"SendSnapshot"), "resolved dispute still schedules SendSnapshot after resync: {left:?}");
 }
+
+/// A second Arbitrum node that is stuck at an older block, as a lagging or stuck RPC in
+/// a fallback set would be. Killed on drop.
+struct LaggingNode(std::process::Child);
+
+impl LaggingNode {
+    async fn fork_at(block: u64) -> (Self, alloy::providers::DynProvider) {
+        let child = std::process::Command::new("anvil")
+            .args(["--fork-url", "http://localhost:8545", "--fork-block-number", &block.to_string(), "-p", "8548", "--chain-id", "31337"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("anvil must be on PATH");
+        let node = LaggingNode(child);
+        let provider = alloy::providers::DynProvider::new(
+            alloy::providers::ProviderBuilder::new().connect_http("http://localhost:8548".parse().unwrap()),
+        );
+        for _ in 0..50 {
+            if provider.get_block_number().await.is_ok() { return (node, provider); }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        panic!("lagging anvil did not start");
+    }
+}
+
+impl Drop for LaggingNode {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// S8: an Arbitrum RPC that lags behind the end of the claimed epoch answers
+/// `snapshots(epoch)` with an older root. `validate_claim` then judged an honest claim
+/// invalid and scheduled a challenge (losing the challenge deposit), and `claim` would
+/// file that stale root (losing the claim deposit). The finality check does not catch
+/// it: on a lagging node the block search returns its head, whose batch is final.
+#[tokio::test]
+#[serial]
+async fn test_s8_lagging_inbox_rpc_does_not_challenge_honest_claim() {
+    use vea_validator::tasks::validate_claim;
+
+    let c = ValidatorConfig::from_env().unwrap();
+    let route = c.build_routes()[0].clone();
+    let outbox_provider = route.outbox_provider.clone();
+    restore_pristine().await;
+
+    let inbox = IVeaInboxArbToEth::new(route.inbox_address, route.inbox_provider.clone());
+    let outbox = IVeaOutboxArbToEth::new(route.outbox_address, outbox_provider.clone());
+    let epoch_period: u64 = inbox.epochPeriod().call().await.unwrap().try_into().unwrap();
+    // Two snapshots in one epoch: the claim must match the last one.
+    send_messages(&route).await;
+    let epoch: u64 = inbox.epochNow().call().await.unwrap().try_into().unwrap();
+    let first = inbox.saveSnapshot().send().await.unwrap().get_receipt().await.unwrap();
+    send_messages(&route).await;
+    inbox.saveSnapshot().send().await.unwrap().get_receipt().await.unwrap();
+    let root = inbox.snapshots(U256::from(epoch)).call().await.unwrap();
+    advance_past_epoch(&outbox_provider, epoch, epoch_period).await;
+    let deposit = outbox.deposit().call().await.unwrap();
+    outbox.claim(U256::from(epoch), root).value(deposit).send().await.unwrap().get_receipt().await.unwrap();
+    advance_time(20 * 60 + 10).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (task_store, claim_store) = stores(&dir);
+    let indexer = EventIndexer::new(route.clone(), c.wallet.default_signer().address(), task_store.clone(), claim_store.clone());
+    indexer.initialize().await;
+    indexer.scan_once().await;
+    assert!(claim_store.lock().unwrap().exists(epoch));
+
+    // The Arbitrum RPC that answers is stuck right after the first snapshot.
+    let (_node, lagging) = LaggingNode::fork_at(first.block_number.unwrap()).await;
+    let mut lagging_route = route.clone();
+    lagging_route.inbox_provider = lagging;
+    let now = outbox_provider.get_block_by_number(Default::default()).await.unwrap().unwrap().header.timestamp;
+
+    let r = validate_claim::execute(&c, &lagging_route, epoch, &claim_store, now, &task_store).await;
+    let tasks = task_store.lock().unwrap().load().tasks;
+    assert!(
+        !tasks.iter().any(|t| t.epoch == epoch && matches!(t.kind, TaskKind::Challenge)),
+        "honest claim scheduled for challenge from a lagging RPC's stale snapshot (result: {r:?})"
+    );
+    assert_eq!(r.unwrap_err().to_string(), "EpochNotFinalized", "a node behind the epoch end is not ready yet");
+}

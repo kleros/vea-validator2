@@ -213,6 +213,8 @@ Before executing critical tasks (`validate_claim`, `claim`, `challenge`), the va
 
 This approach handles arbitrary batch posting delays without hitting RPC block range limits. If the paginated search becomes too slow in production, we'll switch to indexing `SequencerBatchDelivered` events.
 
+**Snapshot reads are pinned past the epoch end (S8):** `validate_claim`, `claim` and `verify_snapshot` read `inbox.snapshots(epoch)` through `finality::final_snapshot`, which finds the first inbox block at or after the epoch end and reads at that block. If the RPC's head is still before the epoch end, the result is "not ready" (`EpochNotFinalized`; `verify_snapshot` retries next poll). Read at "latest", a lagging or stuck node in the fallback set would return an older root saved earlier in the same epoch, making an honest claim look invalid (a wrong challenge loses the deposit) or making us claim a stale root. The finality check alone does not catch this: on a lagging node the block search returns its head, whose batch is final.
+
 **Configuration:**
 - `SEQUENCER_INBOX`: Address of Arbitrum's SequencerInbox on Ethereum L1. **Required in production** - `startup.rs` panics if not set.
 - For tests (local Anvil chains), `SEQUENCER_INBOX` is not set. When `sequencer_inbox` is `None`, finality checks return `Ok(true)` immediately, bypassing the check.

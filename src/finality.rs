@@ -1,10 +1,10 @@
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, FixedBytes, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{BlockNumberOrTag, Filter};
 use alloy::network::Ethereum;
 use alloy::providers::DynProvider;
 
-use crate::contracts::INodeInterface;
+use crate::contracts::{INodeInterface, IVeaInbox};
 use crate::find_block_by_timestamp;
 
 const NODE_INTERFACE: Address = Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xC8]);
@@ -84,4 +84,28 @@ async fn get_l1_block_for_batch(
     }
 
     Ok(None)
+}
+
+/// The inbox snapshot for `epoch`, read at the first inbox block at or after the epoch's
+/// end, or `None` when this RPC has not reached the epoch's end yet (S8).
+///
+/// Read at "latest", a node lagging behind the epoch end answers with an older root
+/// saved earlier in the same epoch (or zero), which would make an honest claim look
+/// invalid, or make us claim a stale root. A head before the epoch end is caught here,
+/// and pinning the read to a post-epoch block makes any other node that lacks that block
+/// fail the call rather than answer with stale data.
+pub async fn final_snapshot(
+    inbox_provider: &DynProvider<Ethereum>,
+    inbox_address: Address,
+    epoch: u64,
+    epoch_period: u64,
+) -> Result<Option<FixedBytes<32>>, Box<dyn std::error::Error + Send + Sync>> {
+    let epoch_end_ts = (epoch + 1) * epoch_period;
+    let block_num = find_block_by_timestamp(inbox_provider, epoch_end_ts).await;
+    match inbox_provider.get_block_by_number(block_num.into()).await? {
+        Some(block) if block.header.timestamp >= epoch_end_ts => {}
+        _ => return Ok(None),
+    }
+    let inbox = IVeaInbox::new(inbox_address, inbox_provider.clone());
+    Ok(Some(inbox.snapshots(U256::from(epoch)).block(block_num.into()).call().await?))
 }
