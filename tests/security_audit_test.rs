@@ -103,3 +103,45 @@ async fn test_s1_old_claim_verification_started_after_fresh_start() {
     let state = task_store.lock().unwrap().load();
     assert!(!state.tasks.iter().any(|t| t.epoch == epoch && matches!(t.kind, TaskKind::Challenge)), "Challenge task should be done");
 }
+
+/// S2: a claim that fails for a non-RPC reason (here: no WETH for the Gnosis deposit)
+/// must not panic the route. The epoch watcher shares the route's `select!` with the
+/// indexer and dispatcher, so a panic there restarts the whole route (5 minutes plus a
+/// resync) and, failing again on every restart, starves the challenge path.
+#[tokio::test]
+#[serial]
+async fn test_s2_failed_claim_does_not_panic_route() {
+    use vea_validator::contracts::IVeaInboxArbToGnosis;
+    use vea_validator::epoch_watcher::EpochWatcher;
+
+    let c = ValidatorConfig::from_env().unwrap();
+    assert!(c.make_claims, "devnet .env.local sets MAKE_CLAIMS=true");
+    let route = c.build_routes()[1].clone();
+    restore_pristine().await;
+
+    let inbox = IVeaInboxArbToGnosis::new(route.inbox_address, route.inbox_provider.clone());
+    let epoch_period: u64 = inbox.epochPeriod().call().await.unwrap().try_into().unwrap();
+    for i in 0..3u8 {
+        inbox.sendMessage(Address::with_last_byte(1), alloy::primitives::Bytes::from(vec![0xAA, i]))
+            .send().await.unwrap().get_receipt().await.unwrap();
+    }
+    let epoch: u64 = inbox.epochNow().call().await.unwrap().try_into().unwrap();
+    inbox.saveSnapshot().send().await.unwrap().get_receipt().await.unwrap();
+    advance_past_epoch(&route.outbox_provider, epoch, epoch_period).await;
+    advance_time(20 * 60 + 10).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (task_store, claim_store) = stores(&dir);
+    task_store.lock().unwrap().set_on_sync(true);
+    let watcher = EpochWatcher::new(c.clone(), route.clone(), true, claim_store, task_store);
+
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        AssertUnwindSafe(watcher.watch_epochs(epoch_period)).catch_unwind(),
+    ).await;
+    match run {
+        Err(_) => {} // still running after the failed claim: the route survives
+        Ok(Err(_)) => panic!("epoch watcher panicked on a failed claim, crashing the route"),
+        Ok(Ok(r)) => panic!("epoch watcher returned unexpectedly: {r:?}"),
+    }
+}

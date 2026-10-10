@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use alloy::providers::Provider;
 use tokio::time::{sleep, Duration};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::{Route, ValidatorConfig};
 use crate::tasks;
@@ -52,8 +52,11 @@ impl EpochWatcher {
             let time_until_next_epoch = next_epoch_start.saturating_sub(now);
 
             if self.task_store.lock().unwrap().is_on_sync() && time_until_next_epoch <= BEFORE_EPOCH_BUFFER && last_before_epoch != Some(current_epoch) {
-                tasks::save_snapshot::execute(&self.route, &self.task_store).await
-                    .unwrap_or_else(|e| panic!("[{}] FATAL: Failed to save snapshot for epoch {}: {}", self.route.name, current_epoch, e));
+                // One attempt per epoch, as before; a failure is logged, never a panic,
+                // because a panic here restarts the whole route, dispatcher included.
+                if let Err(e) = tasks::save_snapshot::execute(&self.route, &self.task_store).await {
+                    error!(logger = "EpochWatcher", route = self.route.name, epoch = current_epoch, "Failed to save snapshot: {e}");
+                }
                 last_before_epoch = Some(current_epoch);
             }
 
@@ -78,9 +81,14 @@ impl EpochWatcher {
                                 skip_claim_until = now + 300;
                             }
                             Err(e) if e.to_string().contains("timed out") || e.to_string().contains("connection") => {
-                            warn!(logger = "EpochWatcher", route = self.route.name, epoch = prev_epoch, "Claim RPC error: {e}, retrying next cycle");
-                        }
-                        Err(e) => panic!("[{}] FATAL: Failed to claim epoch {}: {}", self.route.name, prev_epoch, e),
+                                warn!(logger = "EpochWatcher", route = self.route.name, epoch = prev_epoch, "Claim RPC error: {e}, retrying next cycle");
+                            }
+                            // Claims are optional; a failed one (e.g. no funds for the deposit)
+                            // must not take the route's challenge path down with it (S2).
+                            Err(e) => {
+                                error!(logger = "EpochWatcher", route = self.route.name, epoch = prev_epoch, "Claim failed: {e}, retrying in 5 minutes");
+                                skip_claim_until = now + 300;
+                            }
                         }
                     }
                 }

@@ -94,7 +94,7 @@ On startup, indexer initializes from `now - sync_lookback_secs`. The lookback is
 - **30s HTTP timeout** on all RPC providers (10s connect timeout) — prevents infinite hangs on unresponsive endpoints
 - **Binary search (`find_block_by_timestamp`)**: retries each individual RPC call 3x with exponential backoff (5s, 15s, 45s) before panicking. Binary search state (lo/hi) preserved between retries.
 - **Indexer `scan_chain`**: returns false on RPC failure, retries next cycle (1s later). Does not crash the route.
-- **Epoch watcher**: logs warning and continues loop on RPC failure. Claim RPC timeouts/connection errors are also handled gracefully (warn + retry next cycle). Non-RPC claim errors still panic.
+- **Epoch watcher**: logs warning and continues loop on RPC failure. Claim RPC timeouts/connection errors are also handled gracefully (warn + retry next cycle). Any other claim error (e.g. no funds for the deposit) is logged and retried after 5 minutes, and a failed `saveSnapshot` is logged (one attempt per epoch). Neither panics (S2): the watcher shares the route's `select!` with the indexer and dispatcher, so a panic would restart the whole route and starve the challenge path.
 - **Task dispatcher**: logs warning and returns early on RPC failure (retries next cycle, 15s later). Does not crash the route.
 - **Fallback layer**: with multiple RPCs configured, failures rotate to the next RPC automatically
 
