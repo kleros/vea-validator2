@@ -221,7 +221,7 @@ where
     // across the awaits below, which would make this future non-`Send`.
     let existing = task_store.lock().unwrap().get_pending_tx(&key);
 
-    let (nonce, max_fee, priority_fee) = match existing {
+    let (nonce, max_fee, priority_fee) = match &existing {
         Some(previous) => {
             let nonce = previous.nonce;
             let blocking = blocking_nonce(provider, wallet_address).await;
@@ -284,6 +284,17 @@ where
             if msg.contains("replacement transaction underpriced") {
                 warn!(logger = "Task", route = route_name, action, nonce, "Replacement underpriced, bumping further next cycle");
                 return Err("PendingReplacement".into());
+            }
+            // Only gas estimation executes the call, so a revert means this attempt was
+            // never broadcast (S6). Leaving its record would pin a nonce that another
+            // action may take next, and a later "bump" would replace that action's tx.
+            // Put back what was there before: nothing, or the earlier broadcast's record.
+            if msg.contains("execution reverted") {
+                match &existing {
+                    None => task_store.lock().unwrap().clear_pending_tx(&key),
+                    Some(previous) => task_store.lock().unwrap().set_pending_tx(&key, previous.nonce, previous.max_fee, previous.priority_fee),
+                }
+                return send_tx(Err(e), action, route_name).await;
             }
             // Anything else may or may not have reached a mempool, so the record stays:
             // a stale one is harmless, a lost one risks a duplicate.
@@ -595,8 +606,9 @@ impl TaskStore {
     /// Record the nonce and fees a transaction went out with.
     ///
     /// Written before the transaction is broadcast, so the record cannot be lost by a
-    /// crash between broadcasting and persisting. A send that is then rejected outright
-    /// leaves a harmless stale record: the next attempt simply sends at that nonce.
+    /// crash between broadcasting and persisting. A send that reverts in gas estimation
+    /// gets its record cleared or restored by `send_or_replace` (S6); any other rejected
+    /// send leaves a stale record, and the next attempt simply sends at that nonce.
     pub fn set_pending_tx(&self, key: &str, nonce: u64, max_fee: u128, priority_fee: u128) {
         info!(logger = "TaskStore", route = self.label().as_str(), key, nonce, "Recording pending tx");
         let mut state = self.load();

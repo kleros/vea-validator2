@@ -380,3 +380,52 @@ async fn test_verify_snapshot_task_refuses_dishonest_claim() {
     assert!(outbox_provider.get_logs(&filter).await.unwrap().is_empty(), "dishonest claim was verified");
     assert!(!task_store.lock().unwrap().load().tasks.iter().any(|t| t.epoch == epoch && matches!(t.kind, TaskKind::VerifySnapshot)), "VerifySnapshot should be dropped");
 }
+
+/// S6: a send that reverts in gas estimation was never broadcast, so it must not leave
+/// a pending record. A stale record pins a nonce another action then uses; the next
+/// attempt "bumps" it and silently replaces that other action's in-flight tx.
+#[tokio::test]
+#[serial]
+async fn test_s6_estimate_revert_leaves_no_record_to_hijack_another_tx() {
+    use vea_validator::contracts::IVeaOutbox;
+    use vea_validator::tasks::{pending_key, send_or_replace};
+
+    let c = ValidatorConfig::from_env().unwrap();
+    let route = c.build_routes()[0].clone();
+    let provider = route.outbox_provider.clone();
+    let wallet = c.wallet.default_signer().address();
+    restore_pristine().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (task_store, _) = stores(&dir);
+    let eth_outbox = IVeaOutboxArbToEth::new(route.outbox_address, provider.clone());
+    let outbox = IVeaOutbox::new(route.outbox_address, provider.clone());
+    let key = pending_key("claim", 1);
+
+    // A claim without its deposit reverts in estimation: nothing is broadcast.
+    let n = provider.get_transaction_count(wallet).pending().await.unwrap();
+    let r = send_or_replace(eth_outbox.claim(U256::from(1), FixedBytes::<32>::from(WRONG_ROOT)), &provider, wallet, &task_store, 1, "claim", route.name).await;
+    assert!(r.unwrap_err().to_string().contains("reverted"));
+    assert_eq!(provider.get_transaction_count(wallet).pending().await.unwrap(), n, "nothing was broadcast");
+
+    // Another action (another task or route) now has its tx in flight at nonce n.
+    set_automine(&provider, false).await;
+    let other = outbox.epochPeriod().nonce(n).send().await.unwrap();
+    let other_hash = *other.tx_hash();
+
+    let miner = {
+        let p = provider.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            mine(&p).await;
+        })
+    };
+    send_or_replace(outbox.deposit(), &provider, wallet, &task_store, 1, "claim", route.name).await.unwrap();
+    miner.await.unwrap();
+    set_automine(&provider, true).await;
+
+    assert!(
+        provider.get_transaction_receipt(other_hash).await.unwrap().is_some(),
+        "the other action's in-flight tx was replaced through a stale pending record"
+    );
+    assert!(task_store.lock().unwrap().get_pending_tx(&key).is_none());
+}
