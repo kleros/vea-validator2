@@ -9,18 +9,52 @@ use crate::tasks::{Task, TaskKind, TaskStore, ClaimStore};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Post-execution store action: only a finished task leaves the store.
-/// A rescheduled task reports `false` and keeps its new `execute_after`.
-fn settle(store: &Mutex<TaskStore>, task: &Task, done: bool) {
-    if done {
-        store.lock().unwrap().remove_task(task);
+type TaskResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+const MIN: u64 = 60;
+
+/// What happens to a task after one execution attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// Finished (or judged obsolete): removed from the store.
+    Done,
+    /// Left exactly as it is, so the next poll runs it again.
+    Retry,
+    /// Kept, with `execute_after` pushed this many seconds past now.
+    RescheduleIn(u64),
+}
+
+/// The error-to-decision table. Task modules signal outcomes by returning `Err` with
+/// these exact strings, so a new case needs a row here and a test below.
+fn outcome(kind: &TaskKind, result: &TaskResult) -> Outcome {
+    let e = match result {
+        Ok(()) => return Outcome::Done,
+        Err(e) => e.to_string(),
+    };
+    match kind {
+        TaskKind::ValidateClaim if e == "EpochNotFinalized" => Outcome::RescheduleIn(30 * MIN),
+        // In flight: keep the task as-is so the next cycle replaces it. Must precede the
+        // catch-alls below, or an in-flight tx gets pushed into the future.
+        TaskKind::Challenge | TaskKind::StartVerification | TaskKind::VerifySnapshot | TaskKind::ExecuteRelay { .. }
+            if e == "PendingReplacement" => Outcome::Retry,
+        TaskKind::Challenge if e == "Insufficient funds" => Outcome::RescheduleIn(30 * MIN),
+        TaskKind::Challenge if e == "VerificationStarted" => Outcome::RescheduleIn(20 * MIN),
+        TaskKind::Challenge | TaskKind::StartVerification | TaskKind::VerifySnapshot
+            if e.contains("Invalid claim") => Outcome::RescheduleIn(30 * MIN),
+        TaskKind::ExecuteRelay { .. } if e == "RootNotConfirmed" => Outcome::RescheduleIn(60 * MIN),
+        TaskKind::ExecuteRelay { .. } => Outcome::RescheduleIn(30 * MIN),
+        _ => Outcome::Retry,
     }
 }
 
-/// Push the task to a later time and report it as not done, so it is not removed.
-fn reschedule_and_keep(store: &Mutex<TaskStore>, task: &Task, execute_after: u64) -> bool {
-    store.lock().unwrap().reschedule_task(task, execute_after);
-    false
+/// Apply an [`Outcome`] to the store. Only `Done` removes the task; a rescheduled task
+/// keeps its new `execute_after`.
+fn apply(store: &Mutex<TaskStore>, task: &Task, outcome: Outcome, now: u64) {
+    match outcome {
+        Outcome::Done => store.lock().unwrap().remove_task(task),
+        Outcome::Retry => {}
+        Outcome::RescheduleIn(secs) => store.lock().unwrap().reschedule_task(task, now + secs),
+    }
 }
 
 pub struct TaskDispatcher {
@@ -82,89 +116,43 @@ impl TaskDispatcher {
 
         for task in ready {
             info!(logger = "Dispatcher", route = self.route.name, task = task.kind.name(), epoch = task.epoch, "Executing task");
-            let success = self.execute_task(&task, now).await;
-            if success {
-                info!(logger = "Dispatcher", route = self.route.name, task = task.kind.name(), epoch = task.epoch, "Completed task");
+            let result = self.execute_task(&task, now).await;
+            let decision = outcome(&task.kind, &result);
+            match &result {
+                Ok(()) => info!(logger = "Dispatcher", route = self.route.name, task = task.kind.name(), epoch = task.epoch, "Completed task"),
+                Err(e) => warn!(logger = "Dispatcher", route = self.route.name, task = task.kind.name(), epoch = task.epoch, error = %e, decision = ?decision, "Task not completed"),
             }
-            settle(&self.task_store, &task, success);
+            apply(&self.task_store, &task, decision, now);
         }
     }
 
-    async fn execute_task(&self, task: &Task, current_timestamp: u64) -> bool {
+    async fn execute_task(&self, task: &Task, current_timestamp: u64) -> TaskResult {
         let epoch = task.epoch;
         let wallet_address = self.config.wallet.default_signer().address();
         match &task.kind {
             TaskKind::SaveSnapshot => {
-                tasks::save_snapshot::execute(&self.route, &self.task_store).await.is_ok()
+                tasks::save_snapshot::execute(&self.route, &self.task_store).await
             }
             TaskKind::Claim { .. } => {
-                tasks::claim::execute(
-                    &self.config,
-                    &self.route,
-                    epoch,
-                    &self.claim_store,
-                    current_timestamp,
-                    &self.task_store,
-                ).await.is_ok()
+                tasks::claim::execute(&self.config, &self.route, epoch, &self.claim_store, current_timestamp, &self.task_store).await
             }
             TaskKind::ValidateClaim => {
-                match tasks::validate_claim::execute(
-                    &self.config,
-                    &self.route,
-                    epoch,
-                    &self.claim_store,
-                    current_timestamp,
-                    &self.task_store,
-                ).await {
-                    Ok(_) => true,
-                    Err(e) if e.to_string() == "EpochNotFinalized" => {
-                        reschedule_and_keep(&self.task_store, task, current_timestamp + 30 * 60)
-                    }
-                    Err(_) => false,
-                }
+                tasks::validate_claim::execute(&self.config, &self.route, epoch, &self.claim_store, current_timestamp, &self.task_store).await
             }
             TaskKind::Challenge => {
-                match tasks::challenge::execute(&self.config, &self.route, epoch, &self.claim_store, &self.task_store).await {
-                    Ok(_) => true,
-                    // In flight: keep the task as-is so the next cycle replaces it.
-                    Err(e) if e.to_string() == "PendingReplacement" => false,
-                    Err(e) if e.to_string() == "Insufficient funds" => {
-                        reschedule_and_keep(&self.task_store, task, current_timestamp + 30 * 60)
-                    }
-                    Err(e) if e.to_string() == "VerificationStarted" => {
-                        reschedule_and_keep(&self.task_store, task, current_timestamp + 20 * 60)
-                    }
-                    Err(e) if e.to_string().contains("Invalid claim") => {
-                        reschedule_and_keep(&self.task_store, task, current_timestamp + 30 * 60)
-                    }
-                    Err(_) => false,
-                }
+                tasks::challenge::execute(&self.config, &self.route, epoch, &self.claim_store, &self.task_store).await
             }
             TaskKind::SendSnapshot => {
-                tasks::send_snapshot::execute(&self.route, epoch, &self.claim_store).await.is_ok()
+                tasks::send_snapshot::execute(&self.route, epoch, &self.claim_store).await
             }
             TaskKind::StartVerification => {
-                match tasks::start_verification::execute(&self.route, epoch, &self.claim_store, &self.task_store, wallet_address).await {
-                    Ok(_) => true,
-                    Err(e) if e.to_string() == "PendingReplacement" => false,
-                    Err(e) if e.to_string().contains("Invalid claim") => {
-                        reschedule_and_keep(&self.task_store, task, current_timestamp + 30 * 60)
-                    }
-                    Err(_) => false,
-                }
+                tasks::start_verification::execute(&self.route, epoch, &self.claim_store, &self.task_store, wallet_address).await
             }
             TaskKind::VerifySnapshot => {
-                match tasks::verify_snapshot::execute(&self.route, epoch, &self.claim_store, &self.task_store, wallet_address).await {
-                    Ok(_) => true,
-                    Err(e) if e.to_string() == "PendingReplacement" => false,
-                    Err(e) if e.to_string().contains("Invalid claim") => {
-                        reschedule_and_keep(&self.task_store, task, current_timestamp + 30 * 60)
-                    }
-                    Err(_) => false,
-                }
+                tasks::verify_snapshot::execute(&self.route, epoch, &self.claim_store, &self.task_store, wallet_address).await
             }
             TaskKind::ExecuteRelay { position, l2_sender, dest_addr, l2_block, l1_block, l2_timestamp, amount, data } => {
-                match tasks::execute_relay::execute(
+                tasks::execute_relay::execute(
                     &self.config,
                     &self.route,
                     *position,
@@ -177,22 +165,10 @@ impl TaskDispatcher {
                     data.clone(),
                     &self.task_store,
                     epoch,
-                ).await {
-                    Ok(_) => true,
-                    // Must precede the catch-all below, or an in-flight relay gets
-                    // pushed 30 minutes into the future instead of being replaced.
-                    Err(e) if e.to_string() == "PendingReplacement" => false,
-                    Err(e) if e.to_string() == "RootNotConfirmed" => {
-                        reschedule_and_keep(&self.task_store, task, current_timestamp + 60 * 60)
-                    }
-                    Err(e) => {
-                        warn!(logger = "Dispatcher", route = self.route.name, task = task.kind.name(), epoch, error = %e, "ExecuteRelay failed, rescheduling in 30 minutes");
-                        reschedule_and_keep(&self.task_store, task, current_timestamp + 30 * 60)
-                    }
-                }
+                ).await
             }
             TaskKind::WithdrawDeposit => {
-                tasks::withdraw_deposit::execute(&self.route, epoch, &self.claim_store).await.is_ok()
+                tasks::withdraw_deposit::execute(&self.route, epoch, &self.claim_store).await
             }
         }
     }
@@ -201,6 +177,7 @@ impl TaskDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::{Address, Bytes, U256};
 
     fn store() -> (tempfile::TempDir, Mutex<TaskStore>) {
         let dir = tempfile::tempdir().unwrap();
@@ -212,19 +189,94 @@ mod tests {
         Task { epoch, execute_after, kind }
     }
 
+    fn err(msg: &str) -> TaskResult {
+        Err(msg.into())
+    }
+
+    fn relay() -> TaskKind {
+        TaskKind::ExecuteRelay {
+            position: U256::ZERO, l2_sender: Address::ZERO, dest_addr: Address::ZERO,
+            l2_block: 0, l1_block: 0, l2_timestamp: 0, amount: U256::ZERO, data: Bytes::new(),
+        }
+    }
+
+    fn all_kinds() -> Vec<TaskKind> {
+        vec![
+            TaskKind::SaveSnapshot, TaskKind::Claim { state_root: Default::default() }, TaskKind::ValidateClaim,
+            TaskKind::Challenge, TaskKind::SendSnapshot, TaskKind::StartVerification, TaskKind::VerifySnapshot,
+            relay(), TaskKind::WithdrawDeposit,
+        ]
+    }
+
+    #[test]
+    fn ok_is_done_for_every_kind() {
+        for kind in all_kinds() {
+            assert_eq!(outcome(&kind, &Ok(())), Outcome::Done, "{}", kind.name());
+        }
+    }
+
+    #[test]
+    fn pending_replacement_is_left_untouched_for_every_kind() {
+        // Never rescheduled: the next poll must replace the in-flight tx.
+        for kind in all_kinds() {
+            assert_eq!(outcome(&kind, &err("PendingReplacement")), Outcome::Retry, "{}", kind.name());
+        }
+    }
+
+    #[test]
+    fn validate_claim_rows() {
+        assert_eq!(outcome(&TaskKind::ValidateClaim, &err("EpochNotFinalized")), Outcome::RescheduleIn(30 * MIN));
+        assert_eq!(outcome(&TaskKind::ValidateClaim, &err("rpc down")), Outcome::Retry);
+    }
+
+    #[test]
+    fn challenge_rows() {
+        let k = TaskKind::Challenge;
+        assert_eq!(outcome(&k, &err("Insufficient funds")), Outcome::RescheduleIn(30 * MIN));
+        assert_eq!(outcome(&k, &err("VerificationStarted")), Outcome::RescheduleIn(20 * MIN));
+        assert_eq!(outcome(&k, &err("[ARB_TO_ETH] challenge reverted: Invalid claim.")), Outcome::RescheduleIn(30 * MIN));
+        assert_eq!(outcome(&k, &err("EpochNotFinalized")), Outcome::Retry);
+        assert_eq!(outcome(&k, &err("NonceConsumed")), Outcome::Retry);
+    }
+
+    #[test]
+    fn start_and_verify_rows() {
+        for k in [TaskKind::StartVerification, TaskKind::VerifySnapshot] {
+            assert_eq!(outcome(&k, &err("[R] verifySnapshot reverted: Invalid claim.")), Outcome::RescheduleIn(30 * MIN), "{}", k.name());
+            assert_eq!(outcome(&k, &err("NonceConsumed")), Outcome::Retry, "{}", k.name());
+            // Strings owned by other tasks do not leak into these rows.
+            assert_eq!(outcome(&k, &err("Insufficient funds")), Outcome::Retry, "{}", k.name());
+        }
+    }
+
+    #[test]
+    fn execute_relay_rows() {
+        assert_eq!(outcome(&relay(), &err("RootNotConfirmed")), Outcome::RescheduleIn(60 * MIN));
+        assert_eq!(outcome(&relay(), &err("ExecutionFailed")), Outcome::RescheduleIn(30 * MIN));
+        assert_eq!(outcome(&relay(), &err("anything else")), Outcome::RescheduleIn(30 * MIN));
+    }
+
+    #[test]
+    fn untabled_kinds_retry_on_error() {
+        for k in [TaskKind::SaveSnapshot, TaskKind::Claim { state_root: Default::default() }, TaskKind::SendSnapshot, TaskKind::WithdrawDeposit] {
+            for e in ["EpochNotFinalized", "Invalid claim", "RootNotConfirmed", "boom"] {
+                assert_eq!(outcome(&k, &err(e)), Outcome::Retry, "{} / {e}", k.name());
+            }
+        }
+    }
+
     #[test]
     fn rescheduled_task_stays_with_new_execute_after() {
         let (_dir, store) = store();
         let t = task(7, TaskKind::ValidateClaim, 100);
         store.lock().unwrap().add_task(t.clone());
 
-        let done = reschedule_and_keep(&store, &t, 1900);
-        settle(&store, &t, done);
+        apply(&store, &t, outcome(&t.kind, &err("EpochNotFinalized")), 100);
 
         let tasks = store.lock().unwrap().load().tasks;
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].epoch, 7);
-        assert_eq!(tasks[0].execute_after, 1900);
+        assert_eq!(tasks[0].execute_after, 100 + 30 * MIN);
     }
 
     #[test]
@@ -235,7 +287,7 @@ mod tests {
         store.lock().unwrap().add_task(t.clone());
         store.lock().unwrap().add_task(other);
 
-        settle(&store, &t, true);
+        apply(&store, &t, Outcome::Done, 100);
 
         let tasks = store.lock().unwrap().load().tasks;
         assert_eq!(tasks.len(), 1);
@@ -248,7 +300,7 @@ mod tests {
         let t = task(7, TaskKind::Challenge, 100);
         store.lock().unwrap().add_task(t.clone());
 
-        settle(&store, &t, false);
+        apply(&store, &t, outcome(&t.kind, &err("PendingReplacement")), 5000);
 
         let tasks = store.lock().unwrap().load().tasks;
         assert_eq!(tasks.len(), 1);

@@ -54,7 +54,8 @@ Polls every 15s. Executes tasks when `execute_after` timestamp reached.
 
 Rules for what happens to a task after it runs:
 - **Completed** (or judged obsolete, e.g. already done by another validator): removed from the store.
-- **Rescheduled** (`reschedule_task` with a new `execute_after`): **kept** in the store and runs again at the new time. A rescheduling arm reports "not done" (through one helper, `reschedule_and_keep`), so the post-execution step (`settle`) never removes it.
+- **Rescheduled** (`reschedule_task` with a new `execute_after`): **kept** in the store and runs again at the new time.
+- The decision is one pure table, `dispatcher::outcome(kind, result)` → `Done` / `Retry` / `RescheduleIn(secs)`, applied by `apply`; only `Done` removes a task. Every row is unit-tested, and every failed attempt is logged with its error and decision.
 - **`PendingReplacement`**: the task is left untouched so the next poll replaces the in-flight tx.
 - **Other errors**: the task stays as-is and is retried on the next poll.
 - Rescheduled tasks have **no retry cap**. They end only by: completing successfully; the on-chain state making them moot (`isSpent(position)` for `execute_relay`, other pre-checks that drop the task); or event-driven invalidation by the indexer (see Proactive Task Invalidation). A permanently failing task (e.g. a relay that always errors) keeps logging every 30 minutes and stays in the schedule file until one of those happens.
