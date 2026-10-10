@@ -137,6 +137,7 @@ Each task has its own way of detecting and handling race conditions (another val
 | `challenge` | on revert: `VerificationStarted` event emitted | reschedule +20min |
 | `send_snapshot` | (none - cheap, idempotent) | always try |
 | `start_verification` | `challenger != 0` | drop task |
+| `start_verification` | `timestamp_verification != 0` (already started) | drop task |
 | `start_verification` | on revert: `VerificationStarted` event emitted | drop task |
 | `start_verification` | on revert: `Challenged` event emitted | drop task |
 | `verify_snapshot` | `challenger != 0` | drop task |
@@ -151,11 +152,13 @@ Each task has its own way of detecting and handling race conditions (another val
 
 **Frontrun detection via event checks:** When a task reverts, we check if the expected event was emitted in recent blocks (last 500 blocks, capped at 1000 block range for RPC compatibility). This detects frontruns where another validator's tx landed between our pre-check and tx execution. If the event exists, the job was done - we drop the task. For `challenge`, if `VerificationStarted` was emitted (rare edge case during resync), we reschedule +20min to wait for finality before retrying with updated claim data.
 
-### Missing Claim Data
+### Missing Claim Data (S1)
 
-If we see `Verified`, `VerificationStarted`, or `Challenged` for an epoch whose `Claimed` event was emitted before our sync window, we drop it - we can't reconstruct claim data we never saw.
+If we see `Verified`, `VerificationStarted`, or `Challenged` for an epoch whose `Claimed` event was emitted before our sync window, the indexer backfills the claim from the chain instead of dropping the event or treating it as impossible. `startVerification` and `verifySnapshot` have no deadline, so such events can arrive at any time; a dishonest claim older than the window whose verification starts later must still be validated and challenged.
 
-**Starting mid-bridge:** The validator can be started at any time. On first run (or after a hiatus longer than `sync_lookback_secs`), `indexing_since` is set to `now - sync_lookback_secs` and persisted. Events for epochs whose `Claimed` was before this window are dropped - the contract only stores a claim hash, so the full `Claim` struct can only be reconstructed from witnessing the original `Claimed` event.
+**Backfill:** the outbox accepts a claim for `epoch` only while its clock is in `epoch + 1`, so the `Claimed` log is searched in that one-epoch window of outbox blocks (filtered by the epoch topic). The epoch's `VerificationStarted`/`Challenged` logs between the claim and the current event are fetched too, then everything is replayed through the normal handlers (which schedule `ValidateClaim` etc.), so the stored claim hashes to what the outbox holds. All logs are fetched before anything is stored; an RPC failure panics like the indexer's other RPC failures, and the route restarts and rescans the chunk. Only when no `Claimed` log exists is the event dropped (logged).
+
+**Starting mid-bridge:** The validator can be started at any time. On first run (or after a hiatus longer than `sync_lookback_secs`), `indexing_since` is set to `now - sync_lookback_secs` and persisted. The contract only stores a claim hash, so the full `Claim` struct is reconstructed from the `Claimed` event, either witnessed during the scan or backfilled as above.
 
 ## SnapshotSent Filtering
 

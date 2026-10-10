@@ -17,6 +17,12 @@ pub async fn execute(
         info!(logger = "StartVerification", route = route.name, epoch, "Already challenged, dropping task");
         return Ok(());
     }
+    // Already started (e.g. a claim validated after its VerificationStarted was indexed):
+    // the contract would refuse it forever, so retrying every poll only burns RPC calls.
+    if claim_data.timestamp_verification != 0 {
+        info!(logger = "StartVerification", route = route.name, epoch, "Verification already started, dropping task");
+        return Ok(());
+    }
 
     let claim = claim_store.lock().unwrap().get_claim(epoch);
     let outbox = IVeaOutbox::new(route.outbox_address, route.outbox_provider.clone());
