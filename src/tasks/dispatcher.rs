@@ -168,7 +168,7 @@ impl TaskDispatcher {
                 ).await
             }
             TaskKind::WithdrawDeposit => {
-                tasks::withdraw_deposit::execute(&self.route, epoch, &self.claim_store).await
+                tasks::withdraw_deposit::execute(&self.route, epoch, &self.claim_store, &self.task_store, wallet_address).await
             }
         }
     }

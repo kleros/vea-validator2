@@ -73,6 +73,8 @@ Each route has its own JSON files for persistence:
 
 **Stale record above the fee ceiling (S3):** when a bump would exceed the ceiling but nothing of ours is pending (pending nonce == confirmed nonce, or the mempool read failed), the recorded transaction was dropped or never broadcast, so there is nothing to replace and holding would wait forever for a nonce nobody mines. `send_or_replace` then resends at the same nonce at the market fee. The pinned nonce still rules out a duplicate: a mined original makes the resend fail with "nonce too low" (→ `NonceConsumed`), a still-pending one makes it "underpriced" (→ `PendingReplacement`).
 
+**Every outbox tx is pinned (S9):** `withdraw_deposit` goes through `send_or_replace` like claim, challenge, start/verify and relay. alloy's default nonce filler is a `CachedNonceManager`, which never sees the pinned nonces, so a plain `.send()` on the same provider after any pinned send went out with a stale nonce ("nonce too low") and withdrawals failed until restart. The Arbitrum sends (`saveSnapshot`, `sendSnapshot`) still use the filler; nothing on that provider is pinned, so its cache stays correct.
+
 **Pending tx reconciliation (F16):** in `send_or_replace`, before holding a pending record (fee ceiling reached, or an earlier nonce is blocking), the saved nonce is compared with the account's confirmed (`latest`) nonce. If the confirmed nonce is above it, the transaction was mined: the record is cleared and `NonceConsumed` is returned (callers already handle it; the dispatcher has no dedicated arm, so such a task is retried on the next poll). If the confirmed nonce cannot be read, the hold is kept.
 
 ## Task Types
@@ -156,6 +158,7 @@ Each task has its own way of detecting and handling race conditions (another val
 | `execute_relay` | `roots(root) == 0` | reschedule +1hr |
 | `execute_relay` | any other error / revert | reschedule +30min and log the error (Arbitrum outbox error messages are unreliable, so the cause is logged, not matched) |
 | `withdraw_deposit` | `claimHashes[epoch] == 0` (pre-check) | drop task |
+| `withdraw_deposit` | in flight (`PendingReplacement`) | leave scheduled |
 | `withdraw_deposit` | on revert: `claimHashes[epoch] == 0` | drop task |
 
 **Frontrun detection via event checks:** When a task reverts, we check if the expected event was emitted in recent blocks (last 500 blocks, capped at 1000 block range for RPC compatibility). This detects frontruns where another validator's tx landed between our pre-check and tx execution. If the event exists, the job was done - we drop the task. For `challenge`, if `VerificationStarted` was emitted (rare edge case during resync), we reschedule +20min to wait for finality before retrying with updated claim data.
