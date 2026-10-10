@@ -29,6 +29,12 @@ pub async fn restore_pristine() {
     let _: serde_json::Value = eth.raw_request("evm_revert".into(), vec![serde_json::json!(snapshot_id)]).await.unwrap();
     let _: serde_json::Value = gnosis.raw_request("evm_revert".into(), vec![serde_json::json!(snapshot_id)]).await.unwrap();
 
+    // `evm_revert` does not restore the mining mode; a test that switched automine off
+    // and then failed must not leave it off for the next one.
+    for p in [&arb, &eth, &gnosis] {
+        let _: serde_json::Value = p.raw_request("evm_setAutomine".into(), vec![serde_json::json!(true)]).await.unwrap();
+    }
+
     let new_id: serde_json::Value = arb.raw_request("evm_snapshot".into(), Vec::<serde_json::Value>::new()).await.unwrap();
     let _: serde_json::Value = eth.raw_request("evm_snapshot".into(), Vec::<serde_json::Value>::new()).await.unwrap();
     let _: serde_json::Value = gnosis.raw_request("evm_snapshot".into(), Vec::<serde_json::Value>::new()).await.unwrap();

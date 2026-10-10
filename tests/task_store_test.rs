@@ -155,3 +155,45 @@ fn duplicate_add_task_does_not_stack_or_move() {
     let v = tasks.iter().find(|t| t.kind.name() == "ValidateClaim").unwrap();
     assert_eq!(v.execute_after, 100);
 }
+
+/// Child half of `sigkill_mid_write_leaves_a_loadable_file`: when spawned with
+/// `CRASH_WRITER_DIR` set, rewrites both stores until it is killed. A no-op otherwise.
+#[test]
+fn crash_writer_child() {
+    let Ok(dir) = std::env::var("CRASH_WRITER_DIR") else { return };
+    let dir = std::path::PathBuf::from(dir);
+    let tasks = TaskStore::new(dir.join("sched.json"));
+    let claims = ClaimStore::new(dir.join("claims.json"));
+    for i in 0u64.. {
+        // Large enough that a non-atomic write would often be caught half-done.
+        for k in 0..50 {
+            tasks.set_pending_tx(&format!("action-{k}:{i}"), i, 1, 1);
+        }
+        claims.store(claim(i, (i % 250) as u8));
+    }
+}
+
+/// A real crash, not a simulated one: SIGKILL a process in the middle of writing and
+/// check both stores still load (F2's atomic write). Repeated with varying timing.
+#[test]
+fn sigkill_mid_write_leaves_a_loadable_file() {
+    for round in 0..5u64 {
+        let dir = tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "crash_writer_child", "--test-threads=1"])
+            .env("CRASH_WRITER_DIR", dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300 + round * 137));
+        child.kill().unwrap(); // SIGKILL on unix
+        child.wait().unwrap();
+
+        let tasks = TaskStore::new(dir.path().join("sched.json"));
+        let state = tasks.load(); // panics on corrupted JSON
+        assert!(!state.pending_txs.is_empty(), "round {round}: child wrote nothing before the kill");
+        let claims = ClaimStore::new(dir.path().join("claims.json"));
+        assert!(claims.exists(0), "round {round}: claims file lost its first claim");
+    }
+}

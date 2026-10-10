@@ -186,3 +186,197 @@ async fn test_s3_stale_pending_record_above_ceiling_is_resent() {
     assert_eq!(provider.get_transaction_count(wallet).latest().await.unwrap(), nonce + 1, "tx should be mined at the recorded nonce");
     assert!(task_store.lock().unwrap().get_pending_tx(&pending_key("challenge", 1)).is_none(), "record should be cleared");
 }
+
+async fn set_automine(provider: &impl Provider, on: bool) {
+    let _: serde_json::Value = provider.raw_request("evm_setAutomine".into(), vec![serde_json::json!(on)]).await.unwrap();
+}
+
+async fn mine(provider: &impl Provider) {
+    let _: serde_json::Value = provider.raw_request("evm_mine".into(), Vec::<serde_json::Value>::new()).await.unwrap();
+}
+
+/// Hold path 1 ("queued behind an earlier nonce"): a record above the blocking nonce
+/// is held while the earlier tx is pending, and cleared as `NonceConsumed` once the
+/// confirmed nonce has passed it.
+#[tokio::test]
+#[serial]
+async fn test_hold_path_queued_behind_earlier_nonce() {
+    use vea_validator::contracts::IVeaOutbox;
+    use vea_validator::tasks::{pending_key, send_or_replace};
+
+    let c = ValidatorConfig::from_env().unwrap();
+    let route = c.build_routes()[0].clone();
+    let provider = route.outbox_provider.clone();
+    let wallet = c.wallet.default_signer().address();
+    restore_pristine().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (task_store, _) = stores(&dir);
+    let outbox = IVeaOutbox::new(route.outbox_address, provider.clone());
+    let key = pending_key("challenge", 1);
+    let market = provider.estimate_eip1559_fees().await.unwrap();
+
+    set_automine(&provider, false).await;
+    let n = provider.get_transaction_count(wallet).latest().await.unwrap();
+    let _earlier = outbox.deposit().nonce(n).send().await.unwrap();
+
+    // Our record sits at n + 1, behind the pending tx at n: hold, keep the record.
+    task_store.lock().unwrap().set_pending_tx(&key, n + 1, market.max_fee_per_gas, market.max_priority_fee_per_gas);
+    let r = send_or_replace(outbox.deposit(), &provider, wallet, &task_store, 1, "challenge", route.name).await;
+    assert_eq!(r.unwrap_err().to_string(), "PendingReplacement");
+    assert_eq!(task_store.lock().unwrap().get_pending_tx(&key).unwrap().nonce, n + 1);
+    assert_eq!(provider.get_transaction_count(wallet).pending().await.unwrap(), n + 1, "nothing new broadcast while held");
+
+    // n and n + 1 mine (someone else used n + 1); a new tx is pending at n + 2. Our
+    // record at n + 1 is now below the confirmed nonce: cleared, NonceConsumed.
+    let _other = outbox.deposit().nonce(n + 1).send().await.unwrap();
+    mine(&provider).await;
+    let _later = outbox.deposit().nonce(n + 2).send().await.unwrap();
+    let r = send_or_replace(outbox.deposit(), &provider, wallet, &task_store, 1, "challenge", route.name).await;
+    assert_eq!(r.unwrap_err().to_string(), "NonceConsumed");
+    assert!(task_store.lock().unwrap().get_pending_tx(&key).is_none(), "consumed record should be cleared");
+    set_automine(&provider, true).await;
+}
+
+/// Hold path 2 ("fee ceiling reached"): our own tx is pending at the recorded nonce at
+/// a fee far above market, so it is held (no further bump). Once it is mined the next
+/// attempt learns the nonce is consumed and clears the record.
+#[tokio::test]
+#[serial]
+async fn test_hold_path_fee_ceiling_then_consumed() {
+    use vea_validator::contracts::IVeaOutbox;
+    use vea_validator::tasks::{pending_key, send_or_replace};
+
+    let c = ValidatorConfig::from_env().unwrap();
+    let route = c.build_routes()[0].clone();
+    let provider = route.outbox_provider.clone();
+    let wallet = c.wallet.default_signer().address();
+    restore_pristine().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (task_store, _) = stores(&dir);
+    let outbox = IVeaOutbox::new(route.outbox_address, provider.clone());
+    let key = pending_key("challenge", 1);
+    let market = provider.estimate_eip1559_fees().await.unwrap();
+    let (high_fee, high_tip) = (market.max_fee_per_gas * 100, market.max_priority_fee_per_gas.max(1) * 100);
+
+    set_automine(&provider, false).await;
+    let n = provider.get_transaction_count(wallet).latest().await.unwrap();
+    task_store.lock().unwrap().set_pending_tx(&key, n, high_fee, high_tip);
+    let _ours = outbox.deposit().nonce(n).max_fee_per_gas(high_fee).max_priority_fee_per_gas(high_tip).send().await.unwrap();
+
+    let r = send_or_replace(outbox.deposit(), &provider, wallet, &task_store, 1, "challenge", route.name).await;
+    assert_eq!(r.unwrap_err().to_string(), "PendingReplacement", "pending at 100x market: hold, do not bump");
+    assert_eq!(task_store.lock().unwrap().get_pending_tx(&key).unwrap().max_fee, high_fee, "record unchanged while held");
+
+    mine(&provider).await;
+    let r = send_or_replace(outbox.deposit(), &provider, wallet, &task_store, 1, "challenge", route.name).await;
+    assert_eq!(r.unwrap_err().to_string(), "NonceConsumed");
+    assert!(task_store.lock().unwrap().get_pending_tx(&key).is_none());
+    assert_eq!(provider.get_transaction_count(wallet).latest().await.unwrap(), n + 1, "exactly one tx at the pinned nonce");
+    set_automine(&provider, true).await;
+}
+
+/// F4 re-add path: a replayed `Claimed` log (crash between storing the claim and
+/// scheduling its task) re-adds `ValidateClaim`, unless the claim has moved on.
+#[tokio::test]
+#[serial]
+async fn test_claimed_replay_readds_validate_claim_unless_moved_on() {
+    let c = ValidatorConfig::from_env().unwrap();
+    let route = c.build_routes()[0].clone();
+    let outbox_provider = route.outbox_provider.clone();
+    restore_pristine().await;
+
+    let inbox = IVeaInboxArbToEth::new(route.inbox_address, route.inbox_provider.clone());
+    let outbox = IVeaOutboxArbToEth::new(route.outbox_address, outbox_provider.clone());
+    let epoch_period: u64 = inbox.epochPeriod().call().await.unwrap().try_into().unwrap();
+    send_messages(&route).await;
+    let epoch: u64 = inbox.epochNow().call().await.unwrap().try_into().unwrap();
+    inbox.saveSnapshot().send().await.unwrap().get_receipt().await.unwrap();
+    let root = inbox.snapshots(U256::from(epoch)).call().await.unwrap();
+    advance_past_epoch(&outbox_provider, epoch, epoch_period).await;
+    let deposit = outbox.deposit().call().await.unwrap();
+    outbox.claim(U256::from(epoch), root).value(deposit).send().await.unwrap().get_receipt().await.unwrap();
+    advance_time(20 * 60 + 10).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (task_store, claim_store) = stores(&dir);
+    let indexer = EventIndexer::new(route.clone(), c.wallet.default_signer().address(), task_store.clone(), claim_store.clone());
+    indexer.initialize().await;
+    let start = task_store.lock().unwrap().load();
+    indexer.scan_once().await;
+
+    let has_validate = |ts: &Arc<Mutex<TaskStore>>| ts.lock().unwrap().load().tasks.iter()
+        .any(|t| t.epoch == epoch && matches!(t.kind, TaskKind::ValidateClaim));
+    let replay = |ts: &Arc<Mutex<TaskStore>>| {
+        let s = ts.lock().unwrap();
+        let t = s.load().tasks.into_iter().find(|t| t.epoch == epoch);
+        if let Some(t) = t { s.remove_task(&t); }
+        s.initialize_sync(start.indexing_since.unwrap(), start.inbox_last_block.unwrap(), start.outbox_last_block.unwrap());
+    };
+    assert!(has_validate(&task_store));
+
+    // Crash after store(), before add_task(): the claim exists, the task does not.
+    replay(&task_store);
+    assert!(!has_validate(&task_store));
+    indexer.scan_once().await;
+    assert!(has_validate(&task_store), "replayed Claimed should re-add ValidateClaim");
+    assert_eq!(claim_store.lock().unwrap().get(epoch).state_root, root, "stored claim unchanged");
+
+    // A claim that has moved on (here: challenged) must not get ValidateClaim back.
+    claim_store.lock().unwrap().update(epoch, |c| c.challenger = Address::with_last_byte(9));
+    replay(&task_store);
+    indexer.scan_once().await;
+    assert!(!has_validate(&task_store), "moved-on claim must not get ValidateClaim re-added");
+}
+
+/// F3 wiring: the VerifySnapshot task, run by the dispatcher, refuses to verify a
+/// claim whose root differs from the inbox snapshot, and drops the task.
+#[tokio::test]
+#[serial]
+async fn test_verify_snapshot_task_refuses_dishonest_claim() {
+    let c = ValidatorConfig::from_env().unwrap();
+    let route = c.build_routes()[0].clone();
+    let outbox_provider = route.outbox_provider.clone();
+    restore_pristine().await;
+
+    let inbox = IVeaInboxArbToEth::new(route.inbox_address, route.inbox_provider.clone());
+    let outbox = IVeaOutboxArbToEth::new(route.outbox_address, outbox_provider.clone());
+    let epoch_period: u64 = inbox.epochPeriod().call().await.unwrap().try_into().unwrap();
+    send_messages(&route).await;
+    let epoch: u64 = inbox.epochNow().call().await.unwrap().try_into().unwrap();
+    inbox.saveSnapshot().send().await.unwrap().get_receipt().await.unwrap();
+    advance_past_epoch(&outbox_provider, epoch, epoch_period).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (task_store, claim_store) = stores(&dir);
+    let indexer = EventIndexer::new(route.clone(), c.wallet.default_signer().address(), task_store.clone(), claim_store.clone());
+    indexer.initialize().await;
+    task_store.lock().unwrap().set_on_sync(true);
+
+    let wrong_root = FixedBytes::<32>::from(WRONG_ROOT);
+    let deposit = outbox.deposit().call().await.unwrap();
+    let receipt = outbox.claim(U256::from(epoch), wrong_root).value(deposit).send().await.unwrap().get_receipt().await.unwrap();
+    let claim_ts = outbox_provider.get_block_by_number(receipt.block_number.unwrap().into()).await.unwrap().unwrap().header.timestamp;
+    advance_time(20 * 60 + 10).await;
+    indexer.scan_once().await;
+    // Isolate the verify path: pretend validation never ran.
+    let t = task_store.lock().unwrap().load().tasks.into_iter().find(|t| t.epoch == epoch).unwrap();
+    task_store.lock().unwrap().remove_task(&t);
+
+    advance_time(25 * 3600 + 60).await;
+    outbox.startVerification(U256::from(epoch), Claim {
+        stateRoot: wrong_root, claimer: receipt.from, timestampClaimed: claim_ts as u32,
+        timestampVerification: 0, blocknumberVerification: 0, honest: Party::None, challenger: Address::ZERO,
+    }).send().await.unwrap().get_receipt().await.unwrap();
+    advance_time(20 * 60 + 10).await;
+    indexer.scan_once().await;
+    assert!(task_store.lock().unwrap().load().tasks.iter().any(|t| t.epoch == epoch && matches!(t.kind, TaskKind::VerifySnapshot)));
+
+    advance_time(3600).await;
+    let dispatcher = TaskDispatcher::new(c.clone(), route.clone(), task_store.clone(), claim_store.clone());
+    dispatcher.process_pending().await;
+
+    let sig = alloy::primitives::keccak256("Verified(uint256)");
+    let filter = alloy::rpc::types::Filter::new().address(route.outbox_address).event_signature(sig).from_block(0u64);
+    assert!(outbox_provider.get_logs(&filter).await.unwrap().is_empty(), "dishonest claim was verified");
+    assert!(!task_store.lock().unwrap().load().tasks.iter().any(|t| t.epoch == epoch && matches!(t.kind, TaskKind::VerifySnapshot)), "VerifySnapshot should be dropped");
+}
