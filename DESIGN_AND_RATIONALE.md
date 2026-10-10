@@ -100,6 +100,7 @@ On startup, indexer initializes from `now - sync_lookback_secs`. The lookback is
 - **Epoch watcher**: logs warning and continues loop on RPC failure. Claim RPC timeouts/connection errors are also handled gracefully (warn + retry next cycle). Any other claim error (e.g. no funds for the deposit) is logged and retried after 5 minutes, and a failed `saveSnapshot` is logged (one attempt per epoch). Neither panics (S2): the watcher shares the route's `select!` with the indexer and dispatcher, so a panic would restart the whole route and starve the challenge path.
 - **Task dispatcher**: logs warning and returns early on RPC failure (retries next cycle, 15s later). Does not crash the route.
 - **Fallback layer**: with multiple RPCs configured, failures rotate to the next RPC automatically
+- **No RPC secrets in errors (S5)**: every transport (one URL or several) is wrapped so transport errors carry the redacted URL (scheme and host) instead of the full one; reqwest embeds the URL in every error, URLs commonly hold API keys, and these errors are logged verbatim. Infra-error reclassification stays limited to multi-URL setups.
 
 ### General Errors
 - **RPC failures during indexing**: logged, retry next poll
