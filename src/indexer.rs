@@ -457,7 +457,7 @@ impl EventIndexer {
             c.honest = honest.to_string();
         });
 
-        self.task_store.lock().unwrap().invalidate_tasks(epoch, &["ValidateClaim", "Challenge", "StartVerification", "VerifySnapshot", "ExecuteRelay"]);
+        self.task_store.lock().unwrap().invalidate_tasks(epoch, &["ValidateClaim", "Challenge", "SendSnapshot", "StartVerification", "VerifySnapshot", "ExecuteRelay"]);
 
         self.task_store.lock().unwrap().add_task(Task {
             epoch,

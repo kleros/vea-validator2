@@ -120,7 +120,9 @@ When the indexer processes certain events, it proactively removes tasks that are
 | `Claimed` | (none) |
 | `VerificationStarted` | `StartVerification` |
 | `Challenged` | `ValidateClaim`, `Challenge`, `StartVerification`, `VerifySnapshot` |
-| `Verified` | `ValidateClaim`, `Challenge`, `StartVerification`, `VerifySnapshot`, `ExecuteRelay` |
+| `Verified` | `ValidateClaim`, `Challenge`, `SendSnapshot`, `StartVerification`, `VerifySnapshot`, `ExecuteRelay` |
+
+`SendSnapshot` is invalidated by `Verified` (S7): a resync over an already-resolved dispute would otherwise send the snapshot again and relay a resolution that changes nothing, paying L2 and L1 gas.
 
 This prevents wasted execution attempts and keeps the task queue clean.
 

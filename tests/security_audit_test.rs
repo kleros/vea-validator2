@@ -429,3 +429,59 @@ async fn test_s6_estimate_revert_leaves_no_record_to_hijack_another_tx() {
     );
     assert!(task_store.lock().unwrap().get_pending_tx(&key).is_none());
 }
+
+/// S7: a validator that (re)syncs over a dispute that is already resolved must not
+/// send the snapshot again. `Verified` did not invalidate `SendSnapshot`, so every
+/// challenged-and-resolved epoch in the sync window cost a fresh `sendSnapshot` on L2
+/// and, through the relay it schedules, an L1 `executeTransaction` that resolves nothing.
+#[tokio::test]
+#[serial]
+async fn test_s7_resync_does_not_resend_snapshot_for_resolved_dispute() {
+    let c = ValidatorConfig::from_env().unwrap();
+    let route = c.build_routes()[0].clone();
+    let outbox_provider = route.outbox_provider.clone();
+    let wallet = c.wallet.default_signer().address();
+    restore_pristine().await;
+
+    let inbox = IVeaInboxArbToEth::new(route.inbox_address, route.inbox_provider.clone());
+    let outbox = IVeaOutboxArbToEth::new(route.outbox_address, outbox_provider.clone());
+    let epoch_period: u64 = inbox.epochPeriod().call().await.unwrap().try_into().unwrap();
+    send_messages(&route).await;
+    let epoch: u64 = inbox.epochNow().call().await.unwrap().try_into().unwrap();
+    inbox.saveSnapshot().send().await.unwrap().get_receipt().await.unwrap();
+    advance_past_epoch(&outbox_provider, epoch, epoch_period).await;
+    let deposit = outbox.deposit().call().await.unwrap();
+    outbox.claim(U256::from(epoch), FixedBytes::<32>::from(WRONG_ROOT)).value(deposit).send().await.unwrap().get_receipt().await.unwrap();
+    advance_time(20 * 60 + 10).await;
+
+    // Validator A runs the whole dispute: challenge, sendSnapshot, relay -> Verified.
+    let dir_a = tempfile::tempdir().unwrap();
+    let (ts_a, cs_a) = stores(&dir_a);
+    let indexer_a = EventIndexer::new(route.clone(), wallet, ts_a.clone(), cs_a.clone());
+    indexer_a.initialize().await;
+    ts_a.lock().unwrap().set_on_sync(true);
+    let dispatcher_a = TaskDispatcher::new(c.clone(), route.clone(), ts_a.clone(), cs_a.clone());
+    indexer_a.scan_once().await;
+    dispatcher_a.process_pending().await;
+    dispatcher_a.process_pending().await;
+    advance_time(20 * 60 + 10).await;
+    indexer_a.scan_once().await;
+    dispatcher_a.process_pending().await;
+    advance_time(20 * 60 + 10).await;
+    indexer_a.scan_once().await;
+    advance_time(7 * 24 * 3600 + 3600 + 10).await;
+    dispatcher_a.process_pending().await;
+    let sig = alloy::primitives::keccak256("Verified(uint256)");
+    let filter = alloy::rpc::types::Filter::new().address(route.outbox_address).event_signature(sig).from_block(0u64);
+    assert!(!outbox_provider.get_logs(&filter).await.unwrap().is_empty(), "precondition: dispute resolved");
+    advance_time(20 * 60 + 10).await;
+
+    // Validator B starts fresh; its window covers the whole, finished dispute.
+    let dir_b = tempfile::tempdir().unwrap();
+    let (ts_b, cs_b) = stores(&dir_b);
+    let indexer_b = EventIndexer::new(route.clone(), wallet, ts_b.clone(), cs_b.clone());
+    indexer_b.initialize().await;
+    while !indexer_b.scan_once().await {}
+    let left: Vec<_> = ts_b.lock().unwrap().load().tasks.into_iter().filter(|t| t.epoch == epoch).map(|t| t.kind.name()).collect();
+    assert!(!left.contains(&"SendSnapshot"), "resolved dispute still schedules SendSnapshot after resync: {left:?}");
+}
