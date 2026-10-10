@@ -224,7 +224,8 @@ where
     let (nonce, max_fee, priority_fee) = match existing {
         Some(previous) => {
             let nonce = previous.nonce;
-            if let Some(blocking) = blocking_nonce(provider, wallet_address).await {
+            let blocking = blocking_nonce(provider, wallet_address).await;
+            if let Some(blocking) = blocking {
                 if blocking != nonce {
                     info!(logger = "Task", route = route_name, action, nonce, blocking, "Queued behind an earlier nonce, waiting");
                     // `blocking_nonce` returns the confirmed nonce it just read.
@@ -238,6 +239,15 @@ where
                 (Some(max_fee), Some(priority_fee)) => {
                     info!(logger = "Task", route = route_name, action, nonce, max_fee, "Replacing pending tx with a higher fee");
                     (nonce, max_fee, priority_fee)
+                }
+                // Nothing of ours is pending, so the recorded tx was dropped or never
+                // broadcast: there is nothing to replace, and holding would wait for a
+                // nonce that is never mined (S3). Resend at the same nonce at market fee;
+                // the pinned nonce still rules out a duplicate ("nonce too low" if it was
+                // mined after all, "underpriced" if it is pending somewhere after all).
+                _ if blocking.is_none() => {
+                    warn!(logger = "Task", route = route_name, action, nonce, "Recorded tx not pending, resending at the same nonce at market fee");
+                    (nonce, market.max_fee_per_gas, market.max_priority_fee_per_gas)
                 }
                 _ => {
                     warn!(logger = "Task", route = route_name, action, nonce, "Fee ceiling reached, holding rather than bumping further");

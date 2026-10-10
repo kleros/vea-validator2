@@ -145,3 +145,44 @@ async fn test_s2_failed_claim_does_not_panic_route() {
         Ok(Ok(r)) => panic!("epoch watcher returned unexpectedly: {r:?}"),
     }
 }
+
+/// S3: a pending record whose transaction is in no mempool (dropped, evicted, or never
+/// broadcast because the send errored after the record was written) must not block the
+/// action forever once the market fee has fallen below what the record paid.
+///
+/// Before the fix the bump would exceed the 4x-market ceiling, so `send_or_replace`
+/// held, and the hold only clears when the saved nonce is mined - which never happens
+/// when nothing is pending at that nonce. A challenge stuck like this never goes out.
+#[tokio::test]
+#[serial]
+async fn test_s3_stale_pending_record_above_ceiling_is_resent() {
+    use vea_validator::contracts::IVeaOutbox;
+    use vea_validator::tasks::{pending_key, send_or_replace};
+
+    let c = ValidatorConfig::from_env().unwrap();
+    let route = c.build_routes()[0].clone();
+    let provider = route.outbox_provider.clone();
+    let wallet = c.wallet.default_signer().address();
+    restore_pristine().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (task_store, _) = stores(&dir);
+    let market = provider.estimate_eip1559_fees().await.unwrap();
+    let nonce = provider.get_transaction_count(wallet).pending().await.unwrap();
+    // Recorded when fees were 100x today's market; nothing was ever broadcast.
+    task_store.lock().unwrap().set_pending_tx(
+        &pending_key("challenge", 1), nonce, market.max_fee_per_gas * 100, market.max_priority_fee_per_gas.max(1) * 100,
+    );
+
+    let outbox = IVeaOutbox::new(route.outbox_address, provider.clone());
+    let mut outcome = String::new();
+    for _ in 0..3 {
+        match send_or_replace(outbox.deposit(), &provider, wallet, &task_store, 1, "challenge", route.name).await {
+            Ok(()) => { outcome = "sent".into(); break; }
+            Err(e) => outcome = e.to_string(),
+        }
+    }
+    assert_eq!(outcome, "sent", "stale pending record blocked the send");
+    assert_eq!(provider.get_transaction_count(wallet).latest().await.unwrap(), nonce + 1, "tx should be mined at the recorded nonce");
+    assert!(task_store.lock().unwrap().get_pending_tx(&pending_key("challenge", 1)).is_none(), "record should be cleared");
+}
