@@ -43,6 +43,9 @@ fn outcome(kind: &TaskKind, result: &TaskResult) -> Outcome {
         TaskKind::Challenge | TaskKind::StartVerification | TaskKind::VerifySnapshot | TaskKind::WithdrawDeposit
             if e.contains("Invalid claim") => Outcome::RescheduleIn(30 * MIN),
         TaskKind::ExecuteRelay { .. } if e == "RootNotConfirmed" => Outcome::RescheduleIn(60 * MIN),
+        // The pinned nonce was consumed elsewhere and the record cleared: the next poll
+        // sends fresh, as for every other kind (F16); not a failed relay to push 30 min out.
+        TaskKind::ExecuteRelay { .. } if e == "NonceConsumed" => Outcome::Retry,
         TaskKind::ExecuteRelay { .. } => Outcome::RescheduleIn(30 * MIN),
         _ => Outcome::Retry,
     }
@@ -265,6 +268,7 @@ mod tests {
     fn execute_relay_rows() {
         assert_eq!(outcome(&relay(), &err("RootNotConfirmed")), Outcome::RescheduleIn(60 * MIN));
         assert_eq!(outcome(&relay(), &err("ExecutionFailed")), Outcome::RescheduleIn(30 * MIN));
+        assert_eq!(outcome(&relay(), &err("NonceConsumed")), Outcome::Retry);
         assert_eq!(outcome(&relay(), &err("anything else")), Outcome::RescheduleIn(30 * MIN));
     }
 

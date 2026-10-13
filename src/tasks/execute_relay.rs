@@ -59,7 +59,10 @@ pub async fn execute(
     ).await;
 
     if let Err(e) = &result {
-        if e.to_string() == "PendingReplacement" {
+        // In flight, or our pinned nonce was mined by something else: both are the
+        // dispatcher's business (leave scheduled / retry next poll), not a failed relay.
+        let msg = e.to_string();
+        if msg == "PendingReplacement" || msg == "NonceConsumed" {
             return result;
         }
         error!(logger = "ExecuteRelay", route = route.name, epoch, "Execution failed: {e}");
