@@ -1,6 +1,6 @@
 use alloy::primitives::{Address, FixedBytes, U256};
 use std::sync::{Arc, Mutex};
-use tracing::info;
+use tracing::{info, warn};
 use crate::config::Route;
 use crate::contracts::{IVeaOutbox, Party};
 use crate::tasks::{send_or_replace, ClaimStore, TaskStore};
@@ -40,7 +40,14 @@ pub async fn execute(
                 &route.outbox_provider, wallet_address, task_store, epoch, "withdrawChallengeDeposit", route.name,
             ).await
         }
-        _ => panic!("Cannot withdraw - honest party not determined for epoch {}", epoch),
+        _ => {
+            // The outbox left `honest` at None (an unchallenged claim resolved through
+            // the bridge with a wrong root): neither withdrawal applies. The indexer no
+            // longer schedules this task for such a claim (S10); one persisted before
+            // that is dropped here instead of panicking the route.
+            warn!(logger = "WithdrawDeposit", route = route.name, epoch, "No honest party, nothing to withdraw");
+            return Ok(());
+        }
     };
 
     if let Err(e) = result {

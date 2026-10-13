@@ -8,7 +8,7 @@ use tokio::time::{sleep, Duration};
 use tracing::{info, warn, error};
 
 use crate::config::Route;
-use crate::contracts::{IVeaInbox, IVeaOutbox, IArbSys};
+use crate::contracts::{IVeaOutbox, IArbSys};
 use crate::tasks::{Task, TaskKind, TaskStore, ClaimStore, ClaimData};
 use crate::{find_block_by_timestamp, find_block_by_timestamp_from};
 
@@ -443,22 +443,48 @@ impl EventIndexer {
             return;
         }
 
+        self.task_store.lock().unwrap().invalidate_tasks(epoch, &["ValidateClaim", "Challenge", "SendSnapshot", "StartVerification", "VerifySnapshot", "ExecuteRelay"]);
+
+        // `honest` is read back from the chain, not guessed from the inbox root (S10).
+        // `verifySnapshot` writes Claimer whatever the root; `resolveDisputedClaim`
+        // writes Claimer when the bridged root matches the claim, Challenger when it
+        // does not and the claim was challenged, and leaves None for an unchallenged
+        // claim with a wrong root. The log does not tell the paths apart, but the hash
+        // the outbox stores does: the stored struct must hash to it, or every later
+        // call with it reverts "Invalid claim.".
         let claim = self.claim_store.lock().unwrap().get(epoch);
-
-        let real_state_root = self.get_inbox_snapshot(epoch).await;
-
-        let honest = if claim.state_root == real_state_root {
-            "Claimer"
-        } else {
-            "Challenger"
+        let outbox = IVeaOutbox::new(self.route.outbox_address, self.route.outbox_provider.clone());
+        let claim_hash = outbox.claimHashes(U256::from(epoch)).call().await.expect("Failed to get claim hash");
+        let honest = match claim.honest_party(claim_hash) {
+            Some(h) => h,
+            None if claim_hash == FixedBytes::<32>::ZERO => {
+                info!(logger = "Indexer", route = self.route.name, epoch, "Claim already withdrawn");
+                self.claim_store.lock().unwrap().remove(epoch);
+                return;
+            }
+            None => {
+                error!(logger = "Indexer", route = self.route.name, epoch, claim_hash = ?claim_hash, "Stored claim hashes to the on-chain claim for no honest party, not withdrawing");
+                return;
+            }
         };
-
         self.claim_store.lock().unwrap().update(epoch, |c| {
             c.honest = honest.to_string();
         });
 
-        self.task_store.lock().unwrap().invalidate_tasks(epoch, &["ValidateClaim", "Challenge", "SendSnapshot", "StartVerification", "VerifySnapshot", "ExecuteRelay"]);
-
+        if honest == "None" {
+            // Only an unchallenged claim can be resolved and still have no honest party
+            // (a challenged one is Claimer or Challenger after Verified), so for a
+            // challenged claim this is a stale state read from a lagging node: restart
+            // and rescan, as for any other indexer RPC failure, instead of losing the
+            // challenger's withdrawal. Otherwise neither withdrawal applies; the claim
+            // stays in the store (it is still live on-chain and can be challenged).
+            assert!(
+                claim.challenger == Address::ZERO,
+                "claimHashes[{epoch}] still hashes with honest = None after Verified of a challenged claim: stale RPC state"
+            );
+            warn!(logger = "Indexer", route = self.route.name, epoch, "Verified without an honest party (unchallenged claim with a wrong root resolved through the bridge), nothing to withdraw");
+            return;
+        }
         self.task_store.lock().unwrap().add_task(Task {
             epoch,
             execute_after: block_ts,
@@ -587,10 +613,5 @@ impl EventIndexer {
             ));
         }
         None
-    }
-
-    async fn get_inbox_snapshot(&self, epoch: u64) -> FixedBytes<32> {
-        let inbox = IVeaInbox::new(self.route.inbox_address, self.route.inbox_provider.clone());
-        inbox.snapshots(U256::from(epoch)).call().await.expect("Failed to get inbox snapshot")
     }
 }

@@ -39,7 +39,7 @@ fn outcome(kind: &TaskKind, result: &TaskResult) -> Outcome {
             if e == "PendingReplacement" => Outcome::Retry,
         TaskKind::Challenge if e == "Insufficient funds" => Outcome::RescheduleIn(30 * MIN),
         TaskKind::Challenge if e == "VerificationStarted" => Outcome::RescheduleIn(20 * MIN),
-        TaskKind::Challenge | TaskKind::StartVerification | TaskKind::VerifySnapshot
+        TaskKind::Challenge | TaskKind::StartVerification | TaskKind::VerifySnapshot | TaskKind::WithdrawDeposit
             if e.contains("Invalid claim") => Outcome::RescheduleIn(30 * MIN),
         TaskKind::ExecuteRelay { .. } if e == "RootNotConfirmed" => Outcome::RescheduleIn(60 * MIN),
         TaskKind::ExecuteRelay { .. } => Outcome::RescheduleIn(30 * MIN),
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn start_and_verify_rows() {
-        for k in [TaskKind::StartVerification, TaskKind::VerifySnapshot] {
+        for k in [TaskKind::StartVerification, TaskKind::VerifySnapshot, TaskKind::WithdrawDeposit] {
             assert_eq!(outcome(&k, &err("[R] verifySnapshot reverted: Invalid claim.")), Outcome::RescheduleIn(30 * MIN), "{}", k.name());
             assert_eq!(outcome(&k, &err("NonceConsumed")), Outcome::Retry, "{}", k.name());
             // Strings owned by other tasks do not leak into these rows.
@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn untabled_kinds_retry_on_error() {
-        for k in [TaskKind::SaveSnapshot, TaskKind::Claim { state_root: Default::default() }, TaskKind::SendSnapshot, TaskKind::WithdrawDeposit] {
+        for k in [TaskKind::SaveSnapshot, TaskKind::Claim { state_root: Default::default() }, TaskKind::SendSnapshot] {
             for e in ["EpochNotFinalized", "Invalid claim", "RootNotConfirmed", "boom"] {
                 assert_eq!(outcome(&k, &err(e)), Outcome::Retry, "{} / {e}", k.name());
             }

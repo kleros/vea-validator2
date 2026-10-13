@@ -45,7 +45,7 @@ Reacts to events:
   - if invalid → schedules `task::challenge`
 - `outbox.VerificationStarted` → schedules `task::verify_snapshot` (after minChallengePeriod)
 - `outbox.Challenged` → schedules `task::send_snapshot`
-- `outbox.Verified` → schedules `task::withdraw_deposit`
+- `outbox.Verified` → schedules `task::withdraw_deposit` (`honest` read back from `claimHashes`, S10; nothing scheduled when the contract left it None)
 - `inbox.SnapshotSent` → schedules `task::execute_relay` (after `relay_delay`), **only if emitted by this validator**
 - `inbox.SnapshotSaved` → updates `last_saved_count` (used by save_snapshot logic)
 
@@ -74,6 +74,8 @@ Each route has its own JSON files for persistence:
 **Stale record above the fee ceiling (S3):** when a bump would exceed the ceiling but nothing of ours is pending (pending nonce == confirmed nonce, or the mempool read failed), the recorded transaction was dropped or never broadcast, so there is nothing to replace and holding would wait forever for a nonce nobody mines. `send_or_replace` then resends at the same nonce at the market fee. The pinned nonce still rules out a duplicate: a mined original makes the resend fail with "nonce too low" (→ `NonceConsumed`), a still-pending one makes it "underpriced" (→ `PendingReplacement`).
 
 **Every outbox tx is pinned (S9):** `withdraw_deposit` goes through `send_or_replace` like claim, challenge, start/verify and relay. alloy's default nonce filler is a `CachedNonceManager`, which never sees the pinned nonces, so a plain `.send()` on the same provider after any pinned send went out with a stale nonce ("nonce too low") and withdrawals failed until restart. The Arbitrum sends (`saveSnapshot`, `sendSnapshot`) still use the filler; nothing on that provider is pinned, so its cache stays correct.
+
+**`honest` is read back from the chain (S10):** the outbox stores only `hashClaim(claim)`, so the `Claim` struct the validator rebuilds must hash to it or every later call reverts "Invalid claim.". `honest` cannot be inferred from the inbox root: `verifySnapshot` writes Claimer whatever the root (a dishonest claim nobody challenged in time), and `resolveDisputedClaim` writes Claimer when the bridged root matches, Challenger when it does not and the claim was challenged, and leaves None for an unchallenged claim with a wrong root, while the `Verified` log looks the same in every case. On `Verified` the indexer therefore hashes the stored claim with each candidate (`ClaimData::hash_with_honest`, the contract's `abi.encodePacked` layout) and keeps the one equal to `claimHashes[epoch]` (`honest_party`). A zero hash means the deposit was already withdrawn (claim dropped); no match is logged as an error and nothing is scheduled. None is accepted only for an unchallenged claim (nothing to withdraw, the claim stays and can still be challenged); for a challenged claim it is impossible after `Verified`, so it is treated as a stale state read from a lagging RPC and handled like any other indexer RPC failure. A persisted `WithdrawDeposit` task that still finds `honest == None` is dropped with a warning instead of panicking, and a withdrawal that reverts "Invalid claim." is rescheduled +30 min like the other claim-bound tasks rather than retried every poll.
 
 **Pending tx reconciliation (F16):** in `send_or_replace`, before holding a pending record (fee ceiling reached, or an earlier nonce is blocking), the saved nonce is compared with the account's confirmed (`latest`) nonce. If the confirmed nonce is above it, the transaction was mined: the record is cleared and `NonceConsumed` is returned (callers already handle it; the dispatcher has no dedicated arm, so such a task is retried on the next poll). If the confirmed nonce cannot be read, the hold is kept.
 
@@ -160,6 +162,7 @@ Each task has its own way of detecting and handling race conditions (another val
 | `withdraw_deposit` | `claimHashes[epoch] == 0` (pre-check) | drop task |
 | `withdraw_deposit` | in flight (`PendingReplacement`) | leave scheduled |
 | `withdraw_deposit` | on revert: `claimHashes[epoch] == 0` | drop task |
+| `withdraw_deposit` | on revert: "Invalid claim" | reschedule +30min |
 
 **Frontrun detection via event checks:** When a task reverts, we check if the expected event was emitted in recent blocks (last 500 blocks, capped at 1000 block range for RPC compatibility). This detects frontruns where another validator's tx landed between our pre-check and tx execution. If the event exists, the job was done - we drop the task. For `challenge`, if `VerificationStarted` was emitted (rare edge case during resync), we reschedule +20min to wait for finality before retrying with updated claim data.
 

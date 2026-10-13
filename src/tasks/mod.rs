@@ -441,6 +441,33 @@ pub struct ClaimData {
     pub challenger: Address,
 }
 
+impl ClaimData {
+    /// The outbox's `hashClaim`: `keccak256(abi.encodePacked(stateRoot, claimer,
+    /// timestampClaimed, timestampVerification, blocknumberVerification, honest,
+    /// challenger))`, computed with `honest` in place of the stored value.
+    pub fn hash_with_honest(&self, honest: Party) -> FixedBytes<32> {
+        let mut packed = Vec::with_capacity(85);
+        packed.extend_from_slice(self.state_root.as_slice());
+        packed.extend_from_slice(self.claimer.as_slice());
+        packed.extend_from_slice(&self.timestamp_claimed.to_be_bytes());
+        packed.extend_from_slice(&self.timestamp_verification.to_be_bytes());
+        packed.extend_from_slice(&self.blocknumber_verification.to_be_bytes());
+        packed.push(honest as u8);
+        packed.extend_from_slice(self.challenger.as_slice());
+        alloy::primitives::keccak256(packed)
+    }
+
+    /// The `honest` the outbox wrote for this claim: the candidate whose hash equals
+    /// `claim_hash` (`claimHashes[epoch]`). `None` when no candidate matches, i.e. the
+    /// hash was deleted by a withdrawal or the stored claim is wrong in another field.
+    pub fn honest_party(&self, claim_hash: FixedBytes<32>) -> Option<&'static str> {
+        [(Party::None, "None"), (Party::Claimer, "Claimer"), (Party::Challenger, "Challenger")]
+            .into_iter()
+            .find(|(party, _)| self.hash_with_honest(*party) == claim_hash)
+            .map(|(_, name)| name)
+    }
+}
+
 pub struct ClaimStore {
     path: PathBuf,
 }
@@ -767,5 +794,47 @@ mod tests {
         let e = hold_or_clear(&store, &key, 5, Some(6), "claim", 7, "R");
         assert_eq!(e.to_string(), "NonceConsumed");
         assert!(store.lock().unwrap().get_pending_tx(&key).is_none());
+    }
+
+    fn claim() -> ClaimData {
+        ClaimData {
+            epoch: 1,
+            state_root: FixedBytes::repeat_byte(0x11),
+            claimer: Address::repeat_byte(0x22),
+            timestamp_claimed: 0x1234_5678,
+            timestamp_verification: 0x8765_4321,
+            blocknumber_verification: 0xdead_beef,
+            honest: "None".to_string(),
+            challenger: Address::repeat_byte(0x33),
+        }
+    }
+
+    // Reference hashes from `cast abi-encode --packed` + `cast keccak` over the same
+    // 85 bytes the outbox's `hashClaim` packs, with honest = 0, 1, 2.
+    const HASH_NONE: FixedBytes<32> = alloy::primitives::b256!("ff368b4940e750f11025a640534138cfff9f4fd80af19fcaab697b0a336f9b81");
+    const HASH_CLAIMER: FixedBytes<32> = alloy::primitives::b256!("694c56409884736f7f1627ac67f47ba94b791e1b32062052acba7d51c29f2aa1");
+    const HASH_CHALLENGER: FixedBytes<32> = alloy::primitives::b256!("42c2a82c6f0b252253a14fdef270b67348b4a9497fd5f9aa0a8bfa77b6fa7f64");
+
+    #[test]
+    fn hash_with_honest_matches_the_outbox_hash_claim() {
+        let c = claim();
+        assert_eq!(c.hash_with_honest(Party::None), HASH_NONE);
+        assert_eq!(c.hash_with_honest(Party::Claimer), HASH_CLAIMER);
+        assert_eq!(c.hash_with_honest(Party::Challenger), HASH_CHALLENGER);
+    }
+
+    #[test]
+    fn honest_party_is_whatever_the_chain_hash_says() {
+        // S10: the stored `honest` is not guessed from the inbox root but read back from
+        // the on-chain hash, so every contract path (verifySnapshot: Claimer whatever the
+        // root; resolveDisputedClaim: Claimer / Challenger / None) is mirrored.
+        let c = claim();
+        assert_eq!(c.honest_party(HASH_NONE), Some("None"));
+        assert_eq!(c.honest_party(HASH_CLAIMER), Some("Claimer"));
+        assert_eq!(c.honest_party(HASH_CHALLENGER), Some("Challenger"));
+        assert_eq!(c.honest_party(FixedBytes::ZERO), None, "deleted hash: nothing matches");
+        let mut other = claim();
+        other.timestamp_verification = 0;
+        assert_eq!(other.honest_party(HASH_CLAIMER), None, "a claim wrong in another field matches nothing");
     }
 }

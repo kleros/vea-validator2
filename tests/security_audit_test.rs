@@ -568,3 +568,70 @@ async fn test_s8_lagging_inbox_rpc_does_not_challenge_honest_claim() {
     );
     assert_eq!(r.unwrap_err().to_string(), "EpochNotFinalized", "a node behind the epoch end is not ready yet");
 }
+
+/// S10: the stored `honest` must be what the outbox wrote, not a guess from the inbox
+/// root. `verifySnapshot` writes Claimer whatever the root, so a dishonest claim that
+/// nobody challenged in time (this validator was offline) and that passed the
+/// censorship test is Claimer on-chain. The indexer stored Challenger (root differs
+/// from the snapshot), and `withdrawChallengeDeposit` then reverted with "Invalid
+/// claim." on every poll, forever.
+#[tokio::test]
+#[serial]
+async fn test_s10_verified_unchallenged_dishonest_claim_is_stored_as_claimer() {
+    let c = ValidatorConfig::from_env().unwrap();
+    let route = c.build_routes()[0].clone();
+    let outbox_provider = route.outbox_provider.clone();
+    restore_pristine().await;
+
+    let inbox = IVeaInboxArbToEth::new(route.inbox_address, route.inbox_provider.clone());
+    let outbox = IVeaOutboxArbToEth::new(route.outbox_address, outbox_provider.clone());
+    let epoch_period: u64 = inbox.epochPeriod().call().await.unwrap().try_into().unwrap();
+    send_messages(&route).await;
+    let epoch: u64 = inbox.epochNow().call().await.unwrap().try_into().unwrap();
+    inbox.saveSnapshot().send().await.unwrap().get_receipt().await.unwrap();
+    advance_past_epoch(&outbox_provider, epoch, epoch_period).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (task_store, claim_store) = stores(&dir);
+    let indexer = EventIndexer::new(route.clone(), c.wallet.default_signer().address(), task_store.clone(), claim_store.clone());
+    indexer.initialize().await;
+    task_store.lock().unwrap().set_on_sync(true);
+
+    // The attacker's claim; the validator indexes it but never runs its tasks.
+    let deposit = outbox.deposit().call().await.unwrap();
+    outbox.claim(U256::from(epoch), FixedBytes::<32>::from(WRONG_ROOT)).value(deposit).send().await.unwrap().get_receipt().await.unwrap();
+    advance_time(20 * 60 + 10).await;
+    indexer.scan_once().await;
+
+    // Past sequencerDelayLimit + epochPeriod: the attacker starts verification...
+    advance_time(25 * 3600 + 60).await;
+    let claim = claim_store.lock().unwrap().get_claim(epoch);
+    outbox.startVerification(U256::from(epoch), claim).send().await.unwrap().get_receipt().await.unwrap();
+    advance_time(20 * 60 + 10).await;
+    indexer.scan_once().await;
+
+    // ...and, the censorship test passed, verifies the wrong root unchallenged.
+    let min_challenge = outbox.minChallengePeriod().call().await.unwrap().to::<u64>();
+    advance_time(min_challenge + 10).await;
+    let claim = claim_store.lock().unwrap().get_claim(epoch);
+    outbox.verifySnapshot(U256::from(epoch), claim).send().await.unwrap().get_receipt().await.unwrap();
+    advance_time(20 * 60 + 10).await;
+    indexer.scan_once().await;
+
+    assert_eq!(claim_store.lock().unwrap().get(epoch).honest, "Claimer", "verifySnapshot writes Claimer whatever the root");
+    let stored = claim_store.lock().unwrap().get_claim(epoch);
+    assert_eq!(
+        outbox.hashClaim(stored).call().await.unwrap(),
+        outbox.claimHashes(U256::from(epoch)).call().await.unwrap(),
+        "stored claim must hash to the on-chain claim"
+    );
+
+    // The withdrawal goes through instead of reverting on every poll.
+    let dispatcher = TaskDispatcher::new(c.clone(), route.clone(), task_store.clone(), claim_store.clone());
+    dispatcher.process_pending().await;
+    assert_eq!(outbox.claimHashes(U256::from(epoch)).call().await.unwrap(), FixedBytes::<32>::ZERO, "deposit was not withdrawn");
+    assert!(
+        !task_store.lock().unwrap().load().tasks.iter().any(|t| t.epoch == epoch && matches!(t.kind, TaskKind::WithdrawDeposit)),
+        "WithdrawDeposit should be done"
+    );
+}
