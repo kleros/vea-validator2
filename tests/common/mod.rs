@@ -42,12 +42,23 @@ pub async fn restore_pristine() {
     std::fs::write(SNAPSHOT_FILE, new_id.as_str().unwrap()).unwrap();
 }
 
-pub async fn advance_past_epoch(outbox_provider: &impl Provider, epoch: u64, epoch_period: u64) {
-    let ts = outbox_provider
-        .get_block_by_number(Default::default()).await.unwrap().unwrap()
-        .header.timestamp;
+/// Move every chain's block clock to 10 s past the end of `epoch`.
+///
+/// Each chain advances by its own delta. Adding one delta (taken from the outbox chain)
+/// to all three left Arbitrum ahead by the devnet's uptime: its latest block is mined
+/// at wall time by the test's transactions, while Ethereum's latest block is still the
+/// pristine deploy block. Past ~40 minutes of uptime the epoch watcher then saw the
+/// epoch after the one the test claimed, and `test_claim` failed with "No snapshot".
+pub async fn advance_past_epoch(_outbox_provider: &impl Provider, epoch: u64, epoch_period: u64) {
     let target = (epoch + 1) * epoch_period + 10;
-    advance_time(target - ts).await;
+    for url in ["http://localhost:8545", "http://localhost:8546", "http://localhost:8547"] {
+        let p = ProviderBuilder::new().connect_http(url.parse().unwrap());
+        let ts = p.get_block_by_number(Default::default()).await.unwrap().unwrap().header.timestamp;
+        let _: serde_json::Value = p
+            .raw_request("anvil_mine".into(), vec![serde_json::json!(1), serde_json::json!(target.saturating_sub(ts))])
+            .await
+            .unwrap();
+    }
 }
 
 pub async fn advance_time(seconds: u64) {
