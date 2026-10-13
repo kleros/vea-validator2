@@ -194,6 +194,24 @@ pub async fn blocking_nonce(provider: &DynProvider<Ethereum>, address: Address) 
     (pending > confirmed).then_some(confirmed)
 }
 
+/// One lock per chain for [`send_or_replace`]'s nonce selection and broadcast (S11).
+///
+/// Both routes' dispatchers, both epoch watchers and the relay sign with one wallet, and
+/// on Ethereum the relay even uses a second provider instance. Two of them could read
+/// the same `pending` nonce between each other's selection and broadcast: the second
+/// broadcast is rejected as underpriced, and its next "bump" then replaces the first
+/// one's transaction.
+///
+/// Keyed by the chain id the node reports, which is exactly the nonce space the senders
+/// share (anvil's ids on the devnet differ from the canonical ones, but every provider
+/// for one chain talks to the same node). The `std` mutex only guards the map and is
+/// released within this expression, before anything is awaited; the `tokio` mutex is the
+/// one held across awaits.
+fn send_lock(chain_id: u64) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>> = std::sync::OnceLock::new();
+    LOCKS.get_or_init(Default::default).lock().unwrap().entry(chain_id).or_default().clone()
+}
+
 /// Send `call`, or replace this task's in-flight transaction with a fee-bumped one at
 /// the same nonce.
 ///
@@ -219,6 +237,14 @@ where
 {
     let key = pending_key(action, epoch);
     let market = provider.estimate_eip1559_fees().await?;
+
+    // Held from nonce selection until the broadcast has returned, and released before
+    // the receipt wait (S11): no other sender on this chain may pick a nonce while this
+    // one is between selection and broadcast. Every early return below releases it
+    // through the guard's drop. Nothing under it calls `send_or_replace`, so it cannot
+    // deadlock, and the loops sharing a `select!` make progress while one of them waits.
+    let chain_lock = send_lock(provider.get_chain_id().await?);
+    let broadcasting = chain_lock.lock().await;
 
     // Bound to a local so the `MutexGuard` is dropped here rather than being held
     // across the awaits below, which would make this future non-`Send`.
@@ -274,6 +300,7 @@ where
         .max_priority_fee_per_gas(priority_fee)
         .send()
         .await;
+    drop(broadcasting);
 
     let pending = match sent {
         Ok(pending) => pending,

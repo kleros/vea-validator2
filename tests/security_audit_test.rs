@@ -569,6 +569,51 @@ async fn test_s8_lagging_inbox_rpc_does_not_challenge_honest_claim() {
     assert_eq!(r.unwrap_err().to_string(), "EpochNotFinalized", "a node behind the epoch end is not ready yet");
 }
 
+/// S11: two senders sharing the wallet on one chain (both routes' dispatchers, the
+/// epoch watcher, the relay on its own provider instance) must not pick the same nonce.
+/// Without the per-chain broadcast lock both read the same `pending` count: the second
+/// is rejected as underpriced, and its next attempt "bumps", replacing the first one's
+/// transaction. The two keys and routes differ on purpose - only the chain is shared.
+#[tokio::test]
+#[serial]
+async fn test_s11_concurrent_senders_get_distinct_nonces() {
+    use vea_validator::contracts::IVeaOutbox;
+    use vea_validator::tasks::send_or_replace;
+
+    let c = ValidatorConfig::from_env().unwrap();
+    let route = c.build_routes()[0].clone();
+    let wallet = c.wallet.default_signer().address();
+    restore_pristine().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (task_store, _) = stores(&dir);
+    // Two provider instances on one chain, as the ETH route's outbox and the relay are.
+    let p1 = route.outbox_provider.clone();
+    let p2 = c.ethereum_provider.clone();
+    let n = p1.get_transaction_count(wallet).latest().await.unwrap();
+
+    set_automine(&p1, false).await;
+    let miner = {
+        let p = p1.clone();
+        tokio::spawn(async move {
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                mine(&p).await;
+            }
+        })
+    };
+    let o1 = IVeaOutbox::new(route.outbox_address, p1.clone());
+    let o2 = IVeaOutbox::new(route.outbox_address, p2.clone());
+    let (a, b) = tokio::join!(
+        send_or_replace(o1.deposit(), &p1, wallet, &task_store, 1, "challenge", route.name),
+        send_or_replace(o2.epochPeriod(), &p2, wallet, &task_store, 2, "executeTransaction", "ARB_TO_GNOSIS"),
+    );
+    miner.abort();
+    set_automine(&p1, true).await;
+
+    assert!(a.is_ok() && b.is_ok(), "both concurrent sends should land: {a:?} / {b:?}");
+    assert_eq!(p1.get_transaction_count(wallet).latest().await.unwrap(), n + 2, "one tx at n and one at n + 1");
+}
+
 /// S18/S12: an Arbitrum send whose gas estimate reverts must not leave a nonce gap.
 /// alloy's `CachedNonceManager` hands out the nonce in the same `try_join!` as the gas
 /// estimate and never takes it back, so after one failed `sendSnapshot` the next plain
