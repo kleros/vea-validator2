@@ -569,6 +569,61 @@ async fn test_s8_lagging_inbox_rpc_does_not_challenge_honest_claim() {
     assert_eq!(r.unwrap_err().to_string(), "EpochNotFinalized", "a node behind the epoch end is not ready yet");
 }
 
+/// S18/S12: an Arbitrum send whose gas estimate reverts must not leave a nonce gap.
+/// alloy's `CachedNonceManager` hands out the nonce in the same `try_join!` as the gas
+/// estimate and never takes it back, so after one failed `sendSnapshot` the next plain
+/// `.send()` went out one above the chain's pending nonce and never mined; route
+/// restarts reuse the provider, so only a process restart cleared it.
+///
+/// Driven through the dispatcher, whose signature is the same before and after the fix,
+/// so the test compiles at both commits. Before the fix `process_pending` sits on the
+/// queued SaveSnapshot tx until `RECEIPT_TIMEOUT` (120 s), longer than this test waits;
+/// if the node rejected the gapped tx instead, the snapshot stays zero. (At the old
+/// commit the gapped tx stays in anvil's pool across `evm_revert`: restart the devnet
+/// after running it there.)
+#[tokio::test]
+#[serial]
+async fn test_s18_failed_arbitrum_send_leaves_no_nonce_gap() {
+    use vea_validator::tasks::{ClaimData, Task};
+
+    let c = ValidatorConfig::from_env().unwrap();
+    let route = c.build_routes()[0].clone();
+    let wallet = c.wallet.default_signer().address();
+    restore_pristine().await;
+    let inbox = IVeaInboxArbToEth::new(route.inbox_address, route.inbox_provider.clone());
+    // Plain sends on the route's own provider: primes its cached nonce manager, as the
+    // validator's earlier sends would have. (Unprimed, the first fetch races the
+    // estimate and may be dropped with it, hiding the gap.)
+    send_messages(&route).await;
+    let epoch: u64 = inbox.epochNow().call().await.unwrap().try_into().unwrap();
+    let n = route.inbox_provider.get_transaction_count(wallet).pending().await.unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let (task_store, claim_store) = stores(&dir);
+    task_store.lock().unwrap().set_on_sync(true);
+    // A claim for the current epoch: the inbox refuses its snapshot until the epoch is
+    // over ("Can only send past epoch snapshot."), so the estimate reverts.
+    claim_store.lock().unwrap().store(ClaimData {
+        epoch, state_root: FixedBytes::<32>::from(WRONG_ROOT), claimer: wallet, timestamp_claimed: 1,
+        timestamp_verification: 0, blocknumber_verification: 0, honest: "None".into(), challenger: wallet,
+    });
+    // Store order is execution order: the failing send first, then the one that must land.
+    task_store.lock().unwrap().add_task(Task { epoch, execute_after: 0, kind: TaskKind::SendSnapshot });
+    task_store.lock().unwrap().add_task(Task { epoch, execute_after: 0, kind: TaskKind::SaveSnapshot });
+
+    let dispatcher = TaskDispatcher::new(c.clone(), route.clone(), task_store.clone(), claim_store.clone());
+    let run = tokio::time::timeout(std::time::Duration::from_secs(60), dispatcher.process_pending()).await;
+    assert!(run.is_ok(), "saveSnapshot after a failed sendSnapshot did not land: queued behind a nonce gap");
+
+    assert_ne!(inbox.snapshots(U256::from(epoch)).call().await.unwrap(), FixedBytes::<32>::ZERO, "snapshot not saved");
+    let latest = route.inbox_provider.get_transaction_count(wallet).latest().await.unwrap();
+    let pending = route.inbox_provider.get_transaction_count(wallet).pending().await.unwrap();
+    assert_eq!(latest, n + 1, "exactly the saveSnapshot was mined; the reverted sendSnapshot was never broadcast");
+    assert_eq!(pending, latest, "nothing left queued behind a gap");
+    let left: Vec<_> = task_store.lock().unwrap().load().tasks.into_iter().map(|t| t.kind.name()).collect();
+    assert_eq!(left, vec!["SendSnapshot"], "SaveSnapshot done, SendSnapshot retried next poll");
+}
+
 /// S10: the stored `honest` must be what the outbox wrote, not a guess from the inbox
 /// root. `verifySnapshot` writes Claimer whatever the root, so a dishonest claim that
 /// nobody challenged in time (this validator was offline) and that passed the

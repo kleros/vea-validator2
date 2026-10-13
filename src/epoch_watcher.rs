@@ -54,8 +54,18 @@ impl EpochWatcher {
             if self.task_store.lock().unwrap().is_on_sync() && time_until_next_epoch <= BEFORE_EPOCH_BUFFER && last_before_epoch != Some(current_epoch) {
                 // One attempt per epoch, as before; a failure is logged, never a panic,
                 // because a panic here restarts the whole route, dispatcher included.
-                if let Err(e) = tasks::save_snapshot::execute(&self.route, &self.task_store).await {
-                    error!(logger = "EpochWatcher", route = self.route.name, epoch = current_epoch, "Failed to save snapshot: {e}");
+                let wallet_address = self.config.wallet.default_signer().address();
+                match tasks::save_snapshot::execute(&self.route, &self.task_store, current_epoch, wallet_address).await {
+                    Ok(()) => {}
+                    // Broadcast but unconfirmed past the receipt timeout. Its record keeps
+                    // the nonce, so nothing can duplicate it; by now the 60 s window has
+                    // closed, so like every other outcome this counts as the epoch's attempt.
+                    Err(e) if e.to_string() == "PendingReplacement" => {
+                        warn!(logger = "EpochWatcher", route = self.route.name, epoch = current_epoch, "Snapshot tx still in flight after the receipt timeout");
+                    }
+                    Err(e) => {
+                        error!(logger = "EpochWatcher", route = self.route.name, epoch = current_epoch, "Failed to save snapshot: {e}");
+                    }
                 }
                 last_before_epoch = Some(current_epoch);
             }

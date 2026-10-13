@@ -36,6 +36,7 @@ fn outcome(kind: &TaskKind, result: &TaskResult) -> Outcome {
         // In flight: keep the task as-is so the next cycle replaces it. Must precede the
         // catch-alls below, or an in-flight tx gets pushed into the future.
         TaskKind::Challenge | TaskKind::StartVerification | TaskKind::VerifySnapshot | TaskKind::ExecuteRelay { .. }
+        | TaskKind::SaveSnapshot | TaskKind::SendSnapshot
             if e == "PendingReplacement" => Outcome::Retry,
         TaskKind::Challenge if e == "Insufficient funds" => Outcome::RescheduleIn(30 * MIN),
         TaskKind::Challenge if e == "VerificationStarted" => Outcome::RescheduleIn(20 * MIN),
@@ -131,7 +132,7 @@ impl TaskDispatcher {
         let wallet_address = self.config.wallet.default_signer().address();
         match &task.kind {
             TaskKind::SaveSnapshot => {
-                tasks::save_snapshot::execute(&self.route, &self.task_store).await
+                tasks::save_snapshot::execute(&self.route, &self.task_store, epoch, wallet_address).await
             }
             TaskKind::Claim { .. } => {
                 tasks::claim::execute(&self.config, &self.route, epoch, &self.claim_store, current_timestamp, &self.task_store).await
@@ -143,7 +144,7 @@ impl TaskDispatcher {
                 tasks::challenge::execute(&self.config, &self.route, epoch, &self.claim_store, &self.task_store).await
             }
             TaskKind::SendSnapshot => {
-                tasks::send_snapshot::execute(&self.route, epoch, &self.claim_store).await
+                tasks::send_snapshot::execute(&self.route, epoch, &self.claim_store, &self.task_store, wallet_address).await
             }
             TaskKind::StartVerification => {
                 tasks::start_verification::execute(&self.route, epoch, &self.claim_store, &self.task_store, wallet_address).await
@@ -246,6 +247,17 @@ mod tests {
             assert_eq!(outcome(&k, &err("NonceConsumed")), Outcome::Retry, "{}", k.name());
             // Strings owned by other tasks do not leak into these rows.
             assert_eq!(outcome(&k, &err("Insufficient funds")), Outcome::Retry, "{}", k.name());
+        }
+    }
+
+    /// The Arbitrum sends go through `send_or_replace` too (S18/S12): in flight stays
+    /// scheduled, a consumed nonce or a revert is simply tried again next poll.
+    #[test]
+    fn snapshot_rows() {
+        for k in [TaskKind::SaveSnapshot, TaskKind::SendSnapshot] {
+            assert_eq!(outcome(&k, &err("PendingReplacement")), Outcome::Retry, "{}", k.name());
+            assert_eq!(outcome(&k, &err("NonceConsumed")), Outcome::Retry, "{}", k.name());
+            assert_eq!(outcome(&k, &err("[ARB_TO_ETH] sendSnapshot reverted: Can only send past epoch snapshot.")), Outcome::Retry, "{}", k.name());
         }
     }
 
