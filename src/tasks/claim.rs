@@ -1,4 +1,4 @@
-use alloy::primitives::{FixedBytes, U256};
+use alloy::primitives::{Address, FixedBytes, U256};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 use crate::config::{Route, ValidatorConfig};
@@ -57,10 +57,21 @@ pub async fn execute(
         return Ok(());
     }
 
+    // A pending claim of the same root makes ours redundant, but only an honest one:
+    // anyone could otherwise claim a past epoch with this epoch's root (a dishonest
+    // claim, lost to our challenge) and make us skip this epoch (S16). So the match
+    // counts only if that epoch's final snapshot really is this root.
     let since = (current_timestamp as u32).saturating_sub(SEVEN_DAYS_SECS);
-    if claim_store.lock().unwrap().has_state_root_in_recent_claims(state_root, since) {
-        info!(logger = "Claim", route = route.name, epoch, "State root already in pending claim");
-        return Ok(());
+    let recent = claim_store.lock().unwrap().recent_claims_with_root(state_root, since);
+    for recent_claim in recent {
+        if recent_claim.challenger != Address::ZERO || recent_claim.honest == "Challenger" {
+            continue;
+        }
+        if final_snapshot(&route.inbox_provider, route.inbox_address, recent_claim.epoch, epoch_period).await? == Some(state_root) {
+            info!(logger = "Claim", route = route.name, epoch, pending_epoch = recent_claim.epoch, "State root already in pending claim");
+            return Ok(());
+        }
+        warn!(logger = "Claim", route = route.name, epoch, pending_epoch = recent_claim.epoch, "Pending claim with this root is for another snapshot, not skipping");
     }
 
     let wallet_address = config.wallet.default_signer().address();

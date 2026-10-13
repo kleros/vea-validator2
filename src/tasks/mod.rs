@@ -597,9 +597,11 @@ impl ClaimStore {
         self.save_all(&claims);
     }
 
-    pub fn has_state_root_in_recent_claims(&self, state_root: FixedBytes<32>, since_timestamp: u32) -> bool {
-        let claims = self.load_all();
-        claims.iter().any(|c| c.state_root == state_root && c.timestamp_claimed >= since_timestamp)
+    /// Claims made at or after `since_timestamp` with this state root.
+    pub fn recent_claims_with_root(&self, state_root: FixedBytes<32>, since_timestamp: u32) -> Vec<ClaimData> {
+        self.load_all().into_iter()
+            .filter(|c| c.state_root == state_root && c.timestamp_claimed >= since_timestamp)
+            .collect()
     }
 
     pub fn exists(&self, epoch: u64) -> bool {

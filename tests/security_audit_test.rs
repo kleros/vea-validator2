@@ -791,3 +791,51 @@ async fn test_s15_verify_frontrun_is_recognised() {
         "VerifySnapshot should be dropped after another party's Verified"
     );
 }
+
+/// S16: the "state root already in a pending claim" skip could be griefed. Someone who
+/// claims a past epoch with the next epoch's root (dishonest, that deposit is lost to
+/// our challenge) made this validator skip claiming the next epoch. The skip now counts
+/// only an honest pending claim: one whose epoch's final snapshot is that root.
+#[tokio::test]
+#[serial]
+async fn test_s16_dishonest_claim_with_our_root_does_not_block_our_claim() {
+    use vea_validator::tasks::claim;
+
+    let c = ValidatorConfig::from_env().unwrap();
+    let route = c.build_routes()[0].clone();
+    let wallet = c.wallet.default_signer().address();
+    restore_pristine().await;
+
+    let inbox = IVeaInboxArbToEth::new(route.inbox_address, route.inbox_provider.clone());
+    let outbox = IVeaOutboxArbToEth::new(route.outbox_address, route.outbox_provider.clone());
+    let epoch_period: u64 = inbox.epochPeriod().call().await.unwrap().try_into().unwrap();
+    send_messages(&route).await;
+    let epoch: u64 = inbox.epochNow().call().await.unwrap().try_into().unwrap();
+    inbox.saveSnapshot().send().await.unwrap().get_receipt().await.unwrap();
+    advance_past_epoch(&route.outbox_provider, epoch, epoch_period).await;
+
+    // In epoch + 1: more messages, a snapshot for epoch + 1 saved early (its root is
+    // public), and the griefer claims `epoch` with that root.
+    send_messages(&route).await;
+    inbox.saveSnapshot().send().await.unwrap().get_receipt().await.unwrap();
+    let next_root = inbox.snapshots(U256::from(epoch + 1)).call().await.unwrap();
+    assert_ne!(next_root, inbox.snapshots(U256::from(epoch)).call().await.unwrap(), "precondition: distinct roots");
+    let deposit = outbox.deposit().call().await.unwrap();
+    outbox.claim(U256::from(epoch), next_root).value(deposit).send().await.unwrap().get_receipt().await.unwrap();
+    advance_time(20 * 60 + 10).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (task_store, claim_store) = stores(&dir);
+    let indexer = EventIndexer::new(route.clone(), wallet, task_store.clone(), claim_store.clone());
+    indexer.initialize().await;
+    task_store.lock().unwrap().set_on_sync(true);
+    indexer.scan_once().await;
+    assert!(claim_store.lock().unwrap().exists(epoch), "precondition: the griefer's claim is known");
+
+    // Epoch + 1 is over; this validator wants to claim it with `next_root`.
+    advance_past_epoch(&route.outbox_provider, epoch + 1, epoch_period).await;
+    advance_time(20 * 60).await;
+    let now = route.outbox_provider.get_block_by_number(Default::default()).await.unwrap().unwrap().header.timestamp;
+    claim::execute(&c, &route, epoch + 1, &claim_store, now, &task_store).await.unwrap();
+    assert_ne!(outbox.claimHashes(U256::from(epoch + 1)).call().await.unwrap(), FixedBytes::<32>::ZERO, "our claim for epoch + 1 was skipped");
+}

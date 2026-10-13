@@ -97,6 +97,8 @@ Each route has its own JSON files for persistence:
 | `execute_relay` | SnapshotSent (after `relay_delay`) | executes L2→L1 message on Arbitrum Outbox |
 | `withdraw_deposit` | Verified event | withdraws to honest party |
 
+**Claim skip is griefing-resistant (S16):** `claim` skips an epoch whose root is already in a recent pending claim, so the same root is not deposited on twice. Counting any claim let anyone claim a past epoch with the next epoch's root (dishonest, that deposit is lost to our challenge) and make this validator skip claiming the next epoch. The skip now applies only when the pending claim is honest: not challenged, not resolved for the challenger, and its own epoch's final snapshot (`finality::final_snapshot`) is that root. A dishonest match is logged and ignored.
+
 ## Sync Behavior
 
 On startup, indexer initializes from `now - sync_lookback_secs`. The lookback is computed dynamically from contract parameters: `relay_delay + start_verification_delay + min_challenge_period + buffer`. Events older than sync window are dropped gracefully. Tasks only execute when `on_sync=true`.
@@ -147,7 +149,7 @@ Each task has its own way of detecting and handling race conditions (another val
 | `save_snapshot` | snapshot count unchanged | skip (no-op) |
 | `claim` | `claimHashes[epoch] != 0` (pre-check) | drop task |
 | `claim` | `stateRoot` already matches | drop task |
-| `claim` | state root in pending claim | drop task |
+| `claim` | state root in an honest pending claim (that epoch's final snapshot is the root; S16) | drop task |
 | `claim` | on revert: `claimHashes[epoch] != 0` | drop task |
 | `challenge` | on revert: `Challenged` event emitted | drop task |
 | `challenge` | on revert: `VerificationStarted` event emitted | reschedule +20min |
