@@ -839,3 +839,74 @@ async fn test_s16_dishonest_claim_with_our_root_does_not_block_our_claim() {
     claim::execute(&c, &route, epoch + 1, &claim_store, now, &task_store).await.unwrap();
     assert_ne!(outbox.claimHashes(U256::from(epoch + 1)).call().await.unwrap(), FixedBytes::<32>::ZERO, "our claim for epoch + 1 was skipped");
 }
+/// S13: an RPC failure inside an indexer event handler must not panic the route. Before
+/// the fix every state read in the handlers was an `expect`: one transient error or
+/// `null` from a fallback transport cost a route restart (5 minutes) plus a resync. Now
+/// the handler returns `Err`, `scan_chain` leaves the cursor where it was and rescans the
+/// chunk on the next cycle.
+///
+/// Driven through `dispatch_outbox_event` with a hand-built `Verified` log and an outbox
+/// provider nothing listens on (connection refused at once), so the first state read,
+/// `claimHashes(epoch)`, fails. Needs neither the devnet nor `.env.local`. At b797b88 the
+/// method is private: make it `pub` there to watch the `expect` panic.
+#[tokio::test]
+#[serial]
+async fn test_s13_rpc_failure_in_event_handler_returns_err_instead_of_panicking() {
+    use alloy::primitives::{keccak256, Bytes};
+    use alloy::providers::{DynProvider, ProviderBuilder};
+    use vea_validator::config::{Route, RouteSettings};
+    use vea_validator::tasks::ClaimData;
+
+    let dead = || DynProvider::new(ProviderBuilder::new().connect_http("http://127.0.0.1:9".parse().unwrap()));
+    let route = Route {
+        name: "ARB_TO_ETH",
+        inbox_chain_id: 42161,
+        inbox_address: Address::with_last_byte(0x1A),
+        inbox_provider: dead(),
+        inbox_avg_block_millis: 250,
+        outbox_chain_id: 1,
+        outbox_address: Address::with_last_byte(0x0B),
+        outbox_provider: dead(),
+        weth_address: None,
+        settings: RouteSettings::test_defaults(),
+    };
+
+    let epoch = 42u64;
+    let dir = tempfile::tempdir().unwrap();
+    let (task_store, claim_store) = stores(&dir);
+    // A known, unchallenged claim: the handler gets past `ensure_claim_known` and makes
+    // its first RPC call, `claimHashes(epoch)`.
+    claim_store.lock().unwrap().store(ClaimData {
+        epoch, state_root: FixedBytes::<32>::from(WRONG_ROOT), claimer: Address::with_last_byte(0xC1), timestamp_claimed: 1,
+        timestamp_verification: 0, blocknumber_verification: 0, honest: "None".into(), challenger: Address::ZERO,
+    });
+    let indexer = EventIndexer::new(route.clone(), Address::ZERO, task_store.clone(), claim_store.clone());
+
+    let verified = alloy::rpc::types::Log {
+        inner: alloy::primitives::Log::new_unchecked(
+            route.outbox_address,
+            vec![keccak256("Verified(uint256)"), FixedBytes::<32>::from(U256::from(epoch).to_be_bytes::<32>())],
+            Bytes::new(),
+        ),
+        block_hash: None,
+        block_number: Some(1),
+        // Set, so the handler needs no block fetch for the timestamp.
+        block_timestamp: Some(1_700_000_000),
+        transaction_hash: None,
+        transaction_index: None,
+        log_index: None,
+        removed: false,
+    };
+
+    let outcome = AssertUnwindSafe(indexer.dispatch_outbox_event(&verified)).catch_unwind().await;
+    let result = match outcome {
+        Ok(r) => r,
+        Err(_) => panic!("indexer panicked on an RPC failure inside an event handler"),
+    };
+    assert!(result.is_err(), "an unreachable outbox RPC must surface as Err so the chunk is rescanned");
+
+    // Nothing was decided on the failed read: no withdrawal scheduled, claim untouched.
+    assert!(task_store.lock().unwrap().load().tasks.is_empty(), "no task may be scheduled from a failed state read");
+    let claim = claim_store.lock().unwrap().get(epoch);
+    assert_eq!(claim.honest, "None", "stored claim must not change on a failed read");
+}
