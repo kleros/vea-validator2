@@ -433,9 +433,13 @@ impl EventIndexer {
             return Ok(());
         }
 
-        self.claim_store.lock().unwrap().update(epoch, |c| {
-            c.challenger = challenger;
-        });
+        // Already handled: a chunk rescan (S13) replays this log, and the SendSnapshot it
+        // scheduled may have run in between; task dedup alone would re-add it and send
+        // the snapshot twice. The challenger is written last, so a crash between the
+        // two writes still replays into the scheduling below.
+        if self.claim_store.lock().unwrap().get(epoch).challenger == challenger {
+            return Ok(());
+        }
 
         self.task_store.lock().unwrap().invalidate_tasks(epoch, &["ValidateClaim", "Challenge", "StartVerification", "VerifySnapshot"]);
 
@@ -444,6 +448,10 @@ impl EventIndexer {
             epoch,
             execute_after: block_ts,
             kind: TaskKind::SendSnapshot,
+        });
+
+        self.claim_store.lock().unwrap().update(epoch, |c| {
+            c.challenger = challenger;
         });
         Ok(())
     }
@@ -464,7 +472,19 @@ impl EventIndexer {
             return Ok(());
         }
 
-        self.task_store.lock().unwrap().invalidate_tasks(epoch, &["ValidateClaim", "Challenge", "SendSnapshot", "StartVerification", "VerifySnapshot", "ExecuteRelay"]);
+        // The resolution is in, one way or another: the dispute path is over.
+        self.task_store.lock().unwrap().invalidate_tasks(epoch, &["SendSnapshot", "ExecuteRelay"]);
+
+        // The state read below is at `latest`; a node whose head is still before this
+        // log would answer with the pre-resolution hash, which for an unchallenged claim
+        // is indistinguishable from the real `None` outcome. Refuse such a node here so
+        // the chunk is rescanned instead (partial: the two requests may hit different
+        // transports of a fallback set).
+        let head = self.route.outbox_provider.get_block_number().await?;
+        let log_block = log.block_number.ok_or("log missing block_number")?;
+        if head < log_block {
+            return Err(format!("outbox RPC head {head} is before the Verified log's block {log_block} (lagging node?)").into());
+        }
 
         // `honest` is read back from the chain, not guessed from the inbox root (S10).
         // `verifySnapshot` writes Claimer whatever the root; `resolveDisputedClaim`
@@ -504,11 +524,24 @@ impl EventIndexer {
         });
 
         if honest == "None" {
-            // Neither withdrawal applies; the claim stays in the store (it is still
-            // live on-chain and can be challenged).
-            warn!(logger = "Indexer", route = self.route.name, epoch, "Verified without an honest party (unchallenged claim with a wrong root resolved through the bridge), nothing to withdraw");
+            // Neither withdrawal applies, and the claim is still live: the outbox still
+            // accepts `challenge` (challenger == 0, honest == None) and the claimer can
+            // still start and pass verification. Its root is wrong (a matching root
+            // would have made it Claimer), so it must still be validated and challenged:
+            // keep those tasks, and re-add ValidateClaim if neither is pending.
+            warn!(logger = "Indexer", route = self.route.name, epoch, "Verified without an honest party (unchallenged claim with a wrong root resolved through the bridge), nothing to withdraw; claim stays challengeable");
+            let pending = self.task_store.lock().unwrap().load().tasks.iter()
+                .any(|t| t.epoch == epoch && matches!(t.kind, TaskKind::ValidateClaim | TaskKind::Challenge));
+            if !pending {
+                self.task_store.lock().unwrap().add_task(Task {
+                    epoch,
+                    execute_after: block_ts,
+                    kind: TaskKind::ValidateClaim,
+                });
+            }
             return Ok(());
         }
+        self.task_store.lock().unwrap().invalidate_tasks(epoch, &["ValidateClaim", "Challenge", "StartVerification", "VerifySnapshot"]);
         self.task_store.lock().unwrap().add_task(Task {
             epoch,
             execute_after: block_ts,
@@ -584,9 +617,22 @@ impl EventIndexer {
         }
 
         info!(logger = "Indexer", route = self.route.name, epoch, claim_block, replayed = later.len(), "Backfilled claim from before the sync window");
-        self.handle_claimed_event(&claim_log).await?;
-        for l in &later {
-            Box::pin(self.dispatch_outbox_event(l)).await?;
+        let replayed: Result<(), IndexError> = async {
+            self.handle_claimed_event(&claim_log).await?;
+            for l in &later {
+                Box::pin(self.dispatch_outbox_event(l)).await?;
+            }
+            Ok(())
+        }.await;
+        if let Err(e) = replayed {
+            // The claim must not survive half-built: `ensure_claim_known` would find it
+            // on the rescan and skip the backfill, leaving the verification fields
+            // unset, so every later call with it reverts "Invalid claim.". Roll back and
+            // let the rescan rebuild it from scratch.
+            warn!(logger = "Indexer", route = self.route.name, epoch, "Backfill replay failed, rolling the claim back: {e}");
+            self.claim_store.lock().unwrap().remove(epoch);
+            self.task_store.lock().unwrap().invalidate_tasks(epoch, &["ValidateClaim", "Challenge", "SendSnapshot", "StartVerification", "VerifySnapshot", "WithdrawDeposit"]);
+            return Err(e);
         }
         Ok(true)
     }

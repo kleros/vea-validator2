@@ -910,3 +910,64 @@ async fn test_s13_rpc_failure_in_event_handler_returns_err_instead_of_panicking(
     let claim = claim_store.lock().unwrap().get(epoch);
     assert_eq!(claim.honest, "None", "stored claim must not change on a failed read");
 }
+
+/// Panel F1: `resolveDisputedClaim` for an unchallenged claim with a wrong root emits
+/// `Verified` but leaves `honest = None`; the outbox still accepts `challenge` and the
+/// claimer can still start and pass verification. The handler used to invalidate
+/// ValidateClaim/Challenge on every Verified, so a validator catching up on such a claim
+/// (offline while the week-long bridge resolution ran) never challenged it.
+#[tokio::test]
+#[serial]
+async fn test_panel_verified_without_honest_party_keeps_claim_challengeable() {
+    let c = ValidatorConfig::from_env().unwrap();
+    let route = c.build_routes()[0].clone();
+    let wallet = c.wallet.default_signer().address();
+    restore_pristine().await;
+
+    let inbox = IVeaInboxArbToEth::new(route.inbox_address, route.inbox_provider.clone());
+    let outbox = IVeaOutboxArbToEth::new(route.outbox_address, route.outbox_provider.clone());
+    let epoch_period: u64 = inbox.epochPeriod().call().await.unwrap().try_into().unwrap();
+    send_messages(&route).await;
+    let epoch: u64 = inbox.epochNow().call().await.unwrap().try_into().unwrap();
+    inbox.saveSnapshot().send().await.unwrap().get_receipt().await.unwrap();
+    advance_past_epoch(&route.outbox_provider, epoch, epoch_period).await;
+    let deposit = outbox.deposit().call().await.unwrap();
+    outbox.claim(U256::from(epoch), FixedBytes::<32>::from(WRONG_ROOT)).value(deposit).send().await.unwrap().get_receipt().await.unwrap();
+    advance_time(20 * 60 + 10).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (task_store, claim_store) = stores(&dir);
+    let indexer = EventIndexer::new(route.clone(), wallet, task_store.clone(), claim_store.clone());
+    indexer.initialize().await;
+    task_store.lock().unwrap().set_on_sync(true);
+    indexer.scan_once().await;
+    // The validator knows the claim but never got to validate it (offline).
+    task_store.lock().unwrap().invalidate_tasks(epoch, &["ValidateClaim"]);
+
+    // Anyone sends the unchallenged snapshot through the bridge; the validator relays
+    // its own SnapshotSent a week later and the outbox resolves with honest = None.
+    let claim = claim_store.lock().unwrap().get_claim(epoch);
+    inbox.sendSnapshot(U256::from(epoch), claim).send().await.unwrap().get_receipt().await.unwrap();
+    advance_time(20 * 60 + 10).await;
+    indexer.scan_once().await;
+    let dispatcher = TaskDispatcher::new(c.clone(), route.clone(), task_store.clone(), claim_store.clone());
+    advance_time(7 * 24 * 3600 + 3600 + 10).await;
+    dispatcher.process_pending().await;
+    let sig = alloy::primitives::keccak256("Verified(uint256)");
+    let filter = alloy::rpc::types::Filter::new().address(route.outbox_address).event_signature(sig).from_block(0u64);
+    assert!(!route.outbox_provider.get_logs(&filter).await.unwrap().is_empty(), "precondition: Verified emitted by the bridge resolution");
+    advance_time(20 * 60 + 10).await;
+    indexer.scan_once().await;
+
+    let stored = claim_store.lock().unwrap().get(epoch);
+    assert_eq!(stored.honest, "None", "the contract left no honest party");
+    assert!(
+        task_store.lock().unwrap().load().tasks.iter().any(|t| t.epoch == epoch && matches!(t.kind, TaskKind::ValidateClaim | TaskKind::Challenge)),
+        "a still-challengeable claim must keep (or get back) its ValidateClaim/Challenge task"
+    );
+
+    // And the claim does get challenged.
+    dispatcher.process_pending().await;
+    dispatcher.process_pending().await;
+    assert!(challenged_epochs(&route.outbox_provider, route.outbox_address).await.contains(&epoch), "dishonest claim left unchallenged after a None resolution");
+}
