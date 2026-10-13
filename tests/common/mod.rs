@@ -42,22 +42,26 @@ pub async fn restore_pristine() {
     std::fs::write(SNAPSHOT_FILE, new_id.as_str().unwrap()).unwrap();
 }
 
-/// Move every chain's block clock to 10 s past the end of `epoch`.
+/// Move every chain's block clock to exactly 10 s past the end of `epoch`.
 ///
-/// Each chain advances by its own delta. Adding one delta (taken from the outbox chain)
-/// to all three left Arbitrum ahead by the devnet's uptime: its latest block is mined
-/// at wall time by the test's transactions, while Ethereum's latest block is still the
-/// pristine deploy block. Past ~40 minutes of uptime the epoch watcher then saw the
-/// epoch after the one the test claimed, and `test_claim` failed with "No snapshot".
+/// Set as an absolute timestamp per chain (`evm_setNextBlockTimestamp` + `evm_mine`),
+/// which anvil also adopts as its clock for the blocks that follow. Mining with a
+/// relative interval does not work here: anvil adds the interval to its clock offset
+/// relative to wall time, not to the latest block, so a chain whose latest block is old
+/// (Ethereum's pristine deploy block) ended up ahead by the devnet's uptime and the
+/// epoch watcher claimed the wrong epoch (`test_claim` failed with "No snapshot" or
+/// "Invalid epoch." once the devnet had been up for ~40 minutes).
 pub async fn advance_past_epoch(_outbox_provider: &impl Provider, epoch: u64, epoch_period: u64) {
     let target = (epoch + 1) * epoch_period + 10;
     for url in ["http://localhost:8545", "http://localhost:8546", "http://localhost:8547"] {
         let p = ProviderBuilder::new().connect_http(url.parse().unwrap());
-        let ts = p.get_block_by_number(Default::default()).await.unwrap().unwrap().header.timestamp;
+        let latest = p.get_block_by_number(Default::default()).await.unwrap().unwrap().header.timestamp;
+        assert!(target > latest, "chain {url} is already past the target epoch end ({latest} >= {target})");
         let _: serde_json::Value = p
-            .raw_request("anvil_mine".into(), vec![serde_json::json!(1), serde_json::json!(target.saturating_sub(ts))])
+            .raw_request("evm_setNextBlockTimestamp".into(), vec![serde_json::json!(target)])
             .await
             .unwrap();
+        let _: serde_json::Value = p.raw_request("evm_mine".into(), Vec::<serde_json::Value>::new()).await.unwrap();
     }
 }
 
