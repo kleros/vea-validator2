@@ -169,7 +169,7 @@ Each task has its own way of detecting and handling race conditions (another val
 | `withdraw_deposit` | on revert: `claimHashes[epoch] == 0` | drop task |
 | `withdraw_deposit` | on revert: "Invalid claim" | reschedule +30min |
 
-**Frontrun detection via event checks:** When a task reverts, we check if the expected event was emitted in recent blocks (last 500 blocks, capped at 1000 block range for RPC compatibility). This detects frontruns where another validator's tx landed between our pre-check and tx execution. If the event exists, the job was done - we drop the task. For `challenge`, if `VerificationStarted` was emitted (rare edge case during resync), we reschedule +20min to wait for finality before retrying with updated claim data.
+**Frontrun detection via event checks:** When a task reverts, we check if the expected event was emitted in recent blocks (the last 500 blocks up to the head; a `toBlock` past the head is rejected by some nodes, which made the check always answer "no"). The epoch is read from the first indexed topic or, for `Verified(uint256 _epoch)`, whose epoch neither outbox indexes, from the first data word (S15); before that the verify frontrun check could never match and a claim verified by someone else was rescheduled every 30 minutes instead of dropped. This detects frontruns where another validator's tx landed between our pre-check and tx execution. If the event exists, the job was done - we drop the task. For `challenge`, if `VerificationStarted` was emitted (rare edge case during resync), we reschedule +20min to wait for finality before retrying with updated claim data.
 
 ### Missing Claim Data (S1)
 

@@ -735,3 +735,59 @@ async fn test_s10_verified_unchallenged_dishonest_claim_is_stored_as_claimer() {
         "WithdrawDeposit should be done"
     );
 }
+
+/// S15: `Verified(uint256 _epoch)` does not index its epoch in either outbox, so the
+/// frontrun check for `verifySnapshot` (which keyed on `topics[1]`) could never match.
+/// A claim verified by someone else between our pre-check and our tx reverted "Invalid
+/// claim." and was rescheduled every 30 minutes instead of dropped.
+#[tokio::test]
+#[serial]
+async fn test_s15_verify_frontrun_is_recognised() {
+    let c = ValidatorConfig::from_env().unwrap();
+    let route = c.build_routes()[0].clone();
+    let wallet = c.wallet.default_signer().address();
+    restore_pristine().await;
+    // The other party's sends use fresh provider instances: a provider's cached nonce
+    // filler is stale once a pinned send of ours went out on it.
+    let fresh = || c.build_routes()[0].outbox_provider.clone();
+
+    let inbox = IVeaInboxArbToEth::new(route.inbox_address, route.inbox_provider.clone());
+    let outbox = IVeaOutboxArbToEth::new(route.outbox_address, route.outbox_provider.clone());
+    let epoch_period: u64 = inbox.epochPeriod().call().await.unwrap().try_into().unwrap();
+    send_messages(&route).await;
+    let epoch: u64 = inbox.epochNow().call().await.unwrap().try_into().unwrap();
+    inbox.saveSnapshot().send().await.unwrap().get_receipt().await.unwrap();
+    let root = inbox.snapshots(U256::from(epoch)).call().await.unwrap();
+    advance_past_epoch(&route.outbox_provider, epoch, epoch_period).await;
+    let deposit = outbox.deposit().call().await.unwrap();
+    IVeaOutboxArbToEth::new(route.outbox_address, fresh()).claim(U256::from(epoch), root).value(deposit).send().await.unwrap().get_receipt().await.unwrap();
+    advance_time(20 * 60 + 10).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (task_store, claim_store) = stores(&dir);
+    let indexer = EventIndexer::new(route.clone(), wallet, task_store.clone(), claim_store.clone());
+    indexer.initialize().await;
+    task_store.lock().unwrap().set_on_sync(true);
+    let dispatcher = TaskDispatcher::new(c.clone(), route.clone(), task_store.clone(), claim_store.clone());
+    indexer.scan_once().await;
+    dispatcher.process_pending().await;
+    advance_time(25 * 3600 + 10).await;
+    dispatcher.process_pending().await;
+    advance_time(20 * 60 + 10).await;
+    indexer.scan_once().await;
+    assert!(task_store.lock().unwrap().load().tasks.iter().any(|t| t.epoch == epoch && matches!(t.kind, TaskKind::VerifySnapshot)), "precondition: VerifySnapshot scheduled");
+
+    // Someone else verifies first, with the struct the validator holds.
+    let min_challenge = outbox.minChallengePeriod().call().await.unwrap().to::<u64>();
+    advance_time(min_challenge + 10).await;
+    let claim = claim_store.lock().unwrap().get_claim(epoch);
+    IVeaOutboxArbToEth::new(route.outbox_address, fresh()).verifySnapshot(U256::from(epoch), claim).send().await.unwrap().get_receipt().await.unwrap();
+
+    // Our attempt reverts ("Invalid claim.": honest changed); the Verified log must be
+    // recognised and the task dropped, not rescheduled.
+    dispatcher.process_pending().await;
+    assert!(
+        !task_store.lock().unwrap().load().tasks.iter().any(|t| t.epoch == epoch && matches!(t.kind, TaskKind::VerifySnapshot)),
+        "VerifySnapshot should be dropped after another party's Verified"
+    );
+}

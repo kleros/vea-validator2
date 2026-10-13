@@ -108,12 +108,19 @@ pub async fn was_event_emitted(
         .to_block(current_block);
 
     match provider.get_logs(&filter).await {
-        Ok(logs) => logs.iter().any(|log| {
-            log.topics().get(1)
-                .map(|t| U256::from_be_bytes(t.0).to::<u64>() == epoch)
-                .unwrap_or(false)
-        }),
+        Ok(logs) => logs.iter().any(|log| log_epoch(log) == Some(U256::from(epoch))),
         Err(_) => false,
+    }
+}
+
+/// The epoch an outbox event carries: the first indexed topic, or the first data word
+/// when the event does not index it (`Verified(uint256 _epoch)` in both outboxes, S15;
+/// matching on topics alone could never recognise a verify done by someone else).
+fn log_epoch(log: &alloy::rpc::types::Log) -> Option<U256> {
+    match log.topics().get(1) {
+        Some(t) => Some(U256::from_be_bytes(t.0)),
+        None if log.data().data.len() >= 32 => Some(U256::from_be_slice(&log.data().data[0..32])),
+        None => None,
     }
 }
 
@@ -821,6 +828,24 @@ mod tests {
         let e = hold_or_clear(&store, &key, 5, Some(6), "claim", 7, "R");
         assert_eq!(e.to_string(), "NonceConsumed");
         assert!(store.lock().unwrap().get_pending_tx(&key).is_none());
+    }
+
+    fn raw_log(topics: Vec<FixedBytes<32>>, data: Vec<u8>) -> alloy::rpc::types::Log {
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log::new_unchecked(Address::ZERO, topics, Bytes::from(data)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn log_epoch_reads_the_topic_or_the_first_data_word() {
+        let sig = FixedBytes::<32>::repeat_byte(0xee);
+        let epoch = U256::from(42u64);
+        // Challenged / VerificationStarted: `_epoch` is indexed.
+        assert_eq!(log_epoch(&raw_log(vec![sig, epoch.into()], vec![])), Some(epoch));
+        // Verified(uint256 _epoch): not indexed, so it sits in the data (S15).
+        assert_eq!(log_epoch(&raw_log(vec![sig], epoch.to_be_bytes_vec())), Some(epoch));
+        assert_eq!(log_epoch(&raw_log(vec![sig], vec![1, 2, 3])), None);
     }
 
     fn claim() -> ClaimData {
