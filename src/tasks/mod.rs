@@ -97,12 +97,15 @@ pub async fn was_event_emitted(
     };
     let from_block = current_block.saturating_sub(500);
 
+    // Bounded at the head: a `toBlock` past it is rejected by some nodes (anvil answers
+    // `BlockOutOfRangeError`), which made this check always answer "no", so a task whose
+    // job another party did was rescheduled forever instead of dropped.
     let sig = alloy::primitives::keccak256(event_sig);
     let filter = Filter::new()
         .address(address)
         .event_signature(sig)
         .from_block(from_block)
-        .to_block(from_block + 1000);
+        .to_block(current_block);
 
     match provider.get_logs(&filter).await {
         Ok(logs) => logs.iter().any(|log| {
