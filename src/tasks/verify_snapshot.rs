@@ -1,9 +1,15 @@
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, FixedBytes, U256};
 use std::sync::{Arc, Mutex};
-use tracing::info;
+use tracing::{error, info};
 use crate::config::Route;
-use crate::contracts::IVeaOutbox;
+use crate::contracts::{IVeaInbox, IVeaOutbox};
 use crate::tasks::{send_or_replace, was_event_emitted, ClaimStore, TaskStore};
+
+/// A claim may only be verified when it matches the inbox snapshot. A zero inbox
+/// root means no snapshot was saved for the epoch, which never matches a claim.
+fn should_verify(claimed_root: FixedBytes<32>, inbox_root: FixedBytes<32>) -> bool {
+    inbox_root != FixedBytes::<32>::ZERO && claimed_root == inbox_root
+}
 
 pub async fn execute(
     route: &Route,
@@ -15,6 +21,25 @@ pub async fn execute(
     let claim_data = claim_store.lock().unwrap().get(epoch);
     if claim_data.challenger != Address::ZERO {
         info!(logger = "VerifySnapshot", route = route.name, epoch, "Already challenged, dropping task");
+        return Ok(());
+    }
+
+    let inbox = IVeaInbox::new(route.inbox_address, route.inbox_provider.clone());
+    let inbox_root = match crate::retry_rpc("read inbox snapshot", || async {
+        inbox.snapshots(U256::from(epoch)).call().await
+    }).await {
+        Ok(root) => root,
+        Err(e) => {
+            error!(logger = "VerifySnapshot", route = route.name, epoch, "Failed to read inbox snapshot: {e}");
+            return Err(e.into());
+        }
+    };
+    if !should_verify(claim_data.state_root, inbox_root) {
+        error!(
+            logger = "VerifySnapshot", route = route.name, epoch,
+            claimed = ?claim_data.state_root, inbox = ?inbox_root,
+            "Claim state root differs from inbox snapshot, not verifying"
+        );
         return Ok(());
     }
 
@@ -47,4 +72,29 @@ pub async fn execute(
         return Err(e);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matching_root_verifies() {
+        let r = FixedBytes::<32>::repeat_byte(0xab);
+        assert!(should_verify(r, r));
+    }
+
+    #[test]
+    fn mismatching_root_does_not_verify() {
+        let a = FixedBytes::<32>::repeat_byte(0xab);
+        let b = FixedBytes::<32>::repeat_byte(0xcd);
+        assert!(!should_verify(a, b));
+    }
+
+    #[test]
+    fn zero_inbox_root_is_mismatch() {
+        let a = FixedBytes::<32>::repeat_byte(0xab);
+        assert!(!should_verify(a, FixedBytes::ZERO));
+        assert!(!should_verify(FixedBytes::ZERO, FixedBytes::ZERO));
+    }
 }
