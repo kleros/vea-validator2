@@ -131,7 +131,7 @@ When the indexer processes certain events, it proactively removes tasks that are
 | `Claimed` | (none) |
 | `VerificationStarted` | `StartVerification` |
 | `Challenged` | `ValidateClaim`, `Challenge`, `StartVerification`, `VerifySnapshot` |
-| `Verified` | `SendSnapshot`, `ExecuteRelay`; plus `ValidateClaim`, `Challenge`, `StartVerification`, `VerifySnapshot` when the contract set an honest party (not when it left None, see S10) |
+| `Verified` | `SendSnapshot`, `ExecuteRelay`; plus `ValidateClaim`, `Challenge`, `StartVerification`, `VerifySnapshot` when the contract set an honest party or the deposit was already withdrawn (claim removed), not when it left None (see S10) |
 
 `SendSnapshot` is invalidated by `Verified` (S7): a resync over an already-resolved dispute would otherwise send the snapshot again and relay a resolution that changes nothing, paying L2 and L1 gas.
 

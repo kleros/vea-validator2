@@ -500,6 +500,10 @@ impl EventIndexer {
             Some(h) => h,
             None if claim_hash == FixedBytes::<32>::ZERO => {
                 info!(logger = "Indexer", route = self.route.name, epoch, "Claim already withdrawn");
+                // Resolved and paid out: the claim-bound tasks are obsolete, and once the
+                // claim is removed they would panic on the missing claim (a resync over
+                // an already withdrawn claim leaves ValidateClaim/VerifySnapshot behind).
+                self.task_store.lock().unwrap().invalidate_tasks(epoch, &["ValidateClaim", "Challenge", "StartVerification", "VerifySnapshot"]);
                 self.claim_store.lock().unwrap().remove(epoch);
                 return Ok(());
             }

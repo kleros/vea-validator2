@@ -971,3 +971,68 @@ async fn test_panel_verified_without_honest_party_keeps_claim_challengeable() {
     dispatcher.process_pending().await;
     assert!(challenged_epochs(&route.outbox_provider, route.outbox_address).await.contains(&epoch), "dishonest claim left unchallenged after a None resolution");
 }
+
+/// A resync over an honest claim that was verified and already withdrawn must leave no
+/// claim-bound task behind. `Verified` finds `claimHashes[epoch] == 0` and removes the
+/// claim; the ValidateClaim (from `Claimed`) and VerifySnapshot (from
+/// `VerificationStarted`) it replayed first then panicked on the missing claim in the
+/// dispatcher, on every restart.
+#[tokio::test]
+#[serial]
+async fn test_resync_over_withdrawn_claim_leaves_no_claim_bound_task() {
+    let c = ValidatorConfig::from_env().unwrap();
+    let route = c.build_routes()[0].clone();
+    let outbox_provider = route.outbox_provider.clone();
+    let wallet = c.wallet.default_signer().address();
+    restore_pristine().await;
+
+    let inbox = IVeaInboxArbToEth::new(route.inbox_address, route.inbox_provider.clone());
+    let outbox = IVeaOutboxArbToEth::new(route.outbox_address, outbox_provider.clone());
+    let epoch_period: u64 = inbox.epochPeriod().call().await.unwrap().try_into().unwrap();
+    send_messages(&route).await;
+    let epoch: u64 = inbox.epochNow().call().await.unwrap().try_into().unwrap();
+    inbox.saveSnapshot().send().await.unwrap().get_receipt().await.unwrap();
+    advance_past_epoch(&outbox_provider, epoch, epoch_period).await;
+    let root = inbox.snapshots(U256::from(epoch)).call().await.unwrap();
+    let deposit = outbox.deposit().call().await.unwrap();
+    outbox.claim(U256::from(epoch), root).value(deposit).send().await.unwrap().get_receipt().await.unwrap();
+    advance_time(20 * 60 + 10).await;
+
+    // Validator A follows the honest claim through verification and the withdrawal.
+    let dir_a = tempfile::tempdir().unwrap();
+    let (ts_a, cs_a) = stores(&dir_a);
+    let indexer_a = EventIndexer::new(route.clone(), wallet, ts_a.clone(), cs_a.clone());
+    indexer_a.initialize().await;
+    ts_a.lock().unwrap().set_on_sync(true);
+    indexer_a.scan_once().await;
+    advance_time(25 * 3600 + 60).await;
+    let claim = cs_a.lock().unwrap().get_claim(epoch);
+    outbox.startVerification(U256::from(epoch), claim).send().await.unwrap().get_receipt().await.unwrap();
+    advance_time(20 * 60 + 10).await;
+    indexer_a.scan_once().await;
+    let min_challenge = outbox.minChallengePeriod().call().await.unwrap().to::<u64>();
+    advance_time(min_challenge + 10).await;
+    let claim = cs_a.lock().unwrap().get_claim(epoch);
+    outbox.verifySnapshot(U256::from(epoch), claim).send().await.unwrap().get_receipt().await.unwrap();
+    advance_time(20 * 60 + 10).await;
+    indexer_a.scan_once().await;
+    let dispatcher_a = TaskDispatcher::new(c.clone(), route.clone(), ts_a.clone(), cs_a.clone());
+    dispatcher_a.process_pending().await;
+    assert_eq!(outbox.claimHashes(U256::from(epoch)).call().await.unwrap(), FixedBytes::<32>::ZERO, "precondition: deposit withdrawn");
+    advance_time(20 * 60 + 10).await;
+
+    // Validator B starts fresh; its window covers the claim's whole life.
+    let dir_b = tempfile::tempdir().unwrap();
+    let (ts_b, cs_b) = stores(&dir_b);
+    let indexer_b = EventIndexer::new(route.clone(), wallet, ts_b.clone(), cs_b.clone());
+    indexer_b.initialize().await;
+    while !indexer_b.scan_once().await {}
+    assert!(!cs_b.lock().unwrap().exists(epoch), "withdrawn claim should be dropped from the store");
+    let left: Vec<_> = ts_b.lock().unwrap().load().tasks.into_iter().filter(|t| t.epoch == epoch).map(|t| t.kind.name()).collect();
+    assert!(left.is_empty(), "tasks left for a withdrawn claim: {left:?}");
+
+    ts_b.lock().unwrap().set_on_sync(true);
+    let dispatcher_b = TaskDispatcher::new(c.clone(), route.clone(), ts_b.clone(), cs_b.clone());
+    let ran = AssertUnwindSafe(dispatcher_b.process_pending()).catch_unwind().await;
+    assert!(ran.is_ok(), "dispatcher panicked on a task for a withdrawn claim");
+}
