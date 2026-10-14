@@ -186,6 +186,14 @@ fn sigkill_mid_write_leaves_a_loadable_file() {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
+        // Wait for the first claim before the kill: a fixed delay alone raced the
+        // child's 50 synced writes before it, under load.
+        let claims_path = dir.path().join("claims.json");
+        let started = std::time::Instant::now();
+        while !(claims_path.exists() && ClaimStore::new(claims_path.clone()).exists(0)) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(30), "round {round}: child wrote no claim within 30 s");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         std::thread::sleep(std::time::Duration::from_millis(300 + round * 137));
         child.kill().unwrap(); // SIGKILL on unix
         child.wait().unwrap();
