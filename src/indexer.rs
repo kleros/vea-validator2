@@ -333,8 +333,21 @@ impl EventIndexer {
         let block_ts = get_log_timestamp(log, &self.route.outbox_provider).await;
         let timestamp_claimed = block_ts as u32;
 
-        let state = self.task_store.lock().unwrap().load();
-        if state.tasks.iter().any(|t| t.epoch == epoch) {
+        // Dedup on the claim: a crash between `store()` and `add_task()` replays this log.
+        if self.claim_store.lock().unwrap().exists(epoch) {
+            let has_task = self.task_store.lock().unwrap().load().tasks.iter().any(|t| t.epoch == epoch);
+            let claim = self.claim_store.lock().unwrap().get(epoch);
+            let moved_on = claim.timestamp_verification != 0
+                || claim.challenger != Address::ZERO
+                || claim.honest != "None";
+            if !has_task && !moved_on {
+                info!(logger = "Indexer", route = self.route.name, epoch, "Claim exists without a task, re-adding ValidateClaim");
+                self.task_store.lock().unwrap().add_task(Task {
+                    epoch,
+                    execute_after: block_ts,
+                    kind: TaskKind::ValidateClaim,
+                });
+            }
             return;
         }
 

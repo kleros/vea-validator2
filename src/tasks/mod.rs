@@ -17,9 +17,10 @@ use alloy::rpc::types::Filter;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tracing::{info, warn, error};
+use tracing::{debug, info, warn, error};
 
 use crate::contracts::{Claim, Party};
 use crate::RECEIPT_TIMEOUT;
@@ -113,6 +114,67 @@ pub async fn was_event_emitted(
     }
 }
 
+/// Write `contents` to `path` so a crash leaves either the old or the new complete file.
+///
+/// Writes `<path>.tmp`, fsyncs it, renames it over `path`, then fsyncs the parent
+/// directory on a best-effort basis. A stale `.tmp` from a crash is simply overwritten
+/// by the next save and is never read by the loaders.
+fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+    {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// What a held pending record's saved nonce means given the confirmed (`latest`) nonce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonceStatus {
+    /// The confirmed nonce is above the saved one: the slot was mined.
+    Consumed,
+    /// Not above the saved nonce, or the confirmed nonce is unknown: keep holding.
+    Open,
+}
+
+fn reconcile(saved: u64, confirmed: Option<u64>) -> NonceStatus {
+    match confirmed {
+        Some(c) if c > saved => NonceStatus::Consumed,
+        _ => NonceStatus::Open,
+    }
+}
+
+/// Shared by both hold paths: clear the record and return `NonceConsumed` when the
+/// saved nonce was already mined, otherwise `PendingReplacement`.
+fn hold_or_clear(
+    task_store: &Arc<Mutex<TaskStore>>,
+    key: &str,
+    saved: u64,
+    confirmed: Option<u64>,
+    action: &str,
+    epoch: u64,
+    route_name: &str,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    match reconcile(saved, confirmed) {
+        NonceStatus::Consumed => {
+            warn!(logger = "Task", route = route_name, action, epoch, saved_nonce = saved, confirmed_nonce = confirmed, "Pending nonce already mined, clearing record");
+            task_store.lock().unwrap().clear_pending_tx(key);
+            "NonceConsumed".into()
+        }
+        NonceStatus::Open => "PendingReplacement".into(),
+    }
+}
+
 /// The lowest nonce this account has broadcast but not had confirmed, if any.
 ///
 /// A fee bump only helps the transaction sitting at this nonce; anything numbered
@@ -165,7 +227,8 @@ where
             if let Some(blocking) = blocking_nonce(provider, wallet_address).await {
                 if blocking != nonce {
                     info!(logger = "Task", route = route_name, action, nonce, blocking, "Queued behind an earlier nonce, waiting");
-                    return Err("PendingReplacement".into());
+                    // `blocking_nonce` returns the confirmed nonce it just read.
+                    return Err(hold_or_clear(task_store, &key, nonce, Some(blocking), action, epoch, route_name));
                 }
             }
             match (
@@ -178,7 +241,9 @@ where
                 }
                 _ => {
                     warn!(logger = "Task", route = route_name, action, nonce, "Fee ceiling reached, holding rather than bumping further");
-                    return Err("PendingReplacement".into());
+                    // One `latest` read, deliberately without retry backoff.
+                    let confirmed = provider.get_transaction_count(wallet_address).latest().await.ok();
+                    return Err(hold_or_clear(task_store, &key, nonce, confirmed, action, epoch, route_name));
                 }
             }
         }
@@ -374,14 +439,26 @@ impl ClaimStore {
             fs::create_dir_all(parent).expect("Failed to create claims directory");
         }
         let contents = serde_json::to_string_pretty(claims).expect("Failed to serialize claims");
-        fs::write(&self.path, contents).expect("Failed to write claims file");
+        atomic_write(&self.path, &contents).expect("Failed to write claims file");
     }
 
     pub fn store(&self, claim: ClaimData) {
         let mut claims = self.load_all();
-        let existing = claims.iter().filter(|c| c.epoch == claim.epoch).count();
-        if existing > 0 {
-            panic!("Duplicate claim for epoch {} - this should never happen", claim.epoch);
+        if let Some(stored) = claims.iter().find(|c| c.epoch == claim.epoch) {
+            // A replayed event: keep the stored claim, which may carry later updates.
+            if stored.claimer != claim.claimer
+                || stored.state_root != claim.state_root
+                || stored.timestamp_claimed != claim.timestamp_claimed
+            {
+                error!(
+                    logger = "ClaimStore", epoch = claim.epoch,
+                    stored_claimer = ?stored.claimer, new_claimer = ?claim.claimer,
+                    stored_state_root = ?stored.state_root, new_state_root = ?claim.state_root,
+                    stored_timestamp = stored.timestamp_claimed, new_timestamp = claim.timestamp_claimed,
+                    "Conflicting claim for an existing epoch, keeping the stored claim"
+                );
+            }
+            return;
         }
         claims.push(claim);
         self.save_all(&claims);
@@ -473,12 +550,16 @@ impl TaskStore {
             fs::create_dir_all(parent).expect("Failed to create schedules directory");
         }
         let contents = serde_json::to_string_pretty(state).expect("Failed to serialize state");
-        fs::write(&self.path, contents).expect("Failed to write state file");
+        atomic_write(&self.path, &contents).expect("Failed to write state file");
     }
 
     pub fn add_task(&self, task: Task) {
-        info!(logger = "TaskStore", route = self.label().as_str(), task = task.kind.name(), epoch = task.epoch, execute_after = task.execute_after, "Scheduling task");
         let mut state = self.load();
+        if state.tasks.iter().any(|t| t.epoch == task.epoch && t.kind.name() == task.kind.name()) {
+            debug!(logger = "TaskStore", route = self.label().as_str(), task = task.kind.name(), epoch = task.epoch, "Task already scheduled, skipping");
+            return;
+        }
+        info!(logger = "TaskStore", route = self.label().as_str(), task = task.kind.name(), epoch = task.epoch, execute_after = task.execute_after, "Scheduling task");
         state.tasks.push(task);
         self.save(&state);
     }
@@ -621,5 +702,45 @@ mod bytes_hex {
         let s = String::deserialize(deserializer)?;
         let bytes = hex::decode(s.trim_start_matches("0x")).map_err(serde::de::Error::custom)?;
         Ok(Bytes::from(bytes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconcile_consumed_when_confirmed_above_saved() {
+        assert_eq!(reconcile(5, Some(6)), NonceStatus::Consumed);
+        assert_eq!(reconcile(5, Some(100)), NonceStatus::Consumed);
+    }
+
+    #[test]
+    fn reconcile_open_when_confirmed_not_above_saved() {
+        assert_eq!(reconcile(5, Some(5)), NonceStatus::Open);
+        assert_eq!(reconcile(5, Some(3)), NonceStatus::Open);
+    }
+
+    #[test]
+    fn reconcile_open_when_confirmed_unknown() {
+        assert_eq!(reconcile(5, None), NonceStatus::Open);
+    }
+
+    #[test]
+    fn hold_or_clear_clears_record_only_when_consumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(TaskStore::new(dir.path().join("s.json"))));
+        let key = pending_key("claim", 7);
+        store.lock().unwrap().set_pending_tx(&key, 5, 1, 1);
+
+        let e = hold_or_clear(&store, &key, 5, Some(5), "claim", 7, "R");
+        assert_eq!(e.to_string(), "PendingReplacement");
+        let e = hold_or_clear(&store, &key, 5, None, "claim", 7, "R");
+        assert_eq!(e.to_string(), "PendingReplacement");
+        assert!(store.lock().unwrap().get_pending_tx(&key).is_some());
+
+        let e = hold_or_clear(&store, &key, 5, Some(6), "claim", 7, "R");
+        assert_eq!(e.to_string(), "NonceConsumed");
+        assert!(store.lock().unwrap().get_pending_tx(&key).is_none());
     }
 }
