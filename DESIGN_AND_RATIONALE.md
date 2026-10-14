@@ -52,10 +52,23 @@ Reacts to events:
 ### TaskDispatcher
 Polls every 15s. Executes tasks when `execute_after` timestamp reached.
 
+Rules for what happens to a task after it runs:
+- **Completed** (or judged obsolete, e.g. already done by another validator): removed from the store.
+- **Rescheduled** (`reschedule_task` with a new `execute_after`): **kept** in the store and runs again at the new time. A rescheduling arm reports "not done" (through one helper, `reschedule_and_keep`), so the post-execution step (`settle`) never removes it.
+- **`PendingReplacement`**: the task is left untouched so the next poll replaces the in-flight tx.
+- **Other errors**: the task stays as-is and is retried on the next poll.
+- Rescheduled tasks have **no retry cap**. They end only by: completing successfully; the on-chain state making them moot (`isSpent(position)` for `execute_relay`, other pre-checks that drop the task); or event-driven invalidation by the indexer (see Proactive Task Invalidation). A permanently failing task (e.g. a relay that always errors) keeps logging every 30 minutes and stays in the schedule file until one of those happens.
+
 ### TaskStore / ClaimStore
 Each route has its own JSON files for persistence:
 - **TaskStore**: scheduled tasks, indexer block cursors, `indexing_since` timestamp, `on_sync` flag
 - **ClaimStore**: claim data (state root, claimer, timestamps, challenger, honest party) needed to reconstruct `Claim` structs for contract calls
+
+**Atomic writes (F2):** both stores write `<file>.tmp`, fsync it, and rename it over the original (one shared helper). A crash at any point leaves either the old or the new complete file, never truncated JSON.
+
+**Idempotent replay (F4):** a replayed `Claimed` event (e.g. after a crash between storing the claim and scheduling its task) is safe. The indexer dedups on whether the claim exists, not on whether a task exists. `ClaimStore::store` never panics on an existing epoch and never overwrites it. A claim that exists without its `ValidateClaim` task gets the task re-added. `TaskStore::add_task` keeps at most one task per (epoch, kind); a duplicate is skipped and the stored task stays exactly as it is.
+
+**Pending tx reconciliation (F16):** in `send_or_replace`, before holding a pending record (fee ceiling reached, or an earlier nonce is blocking), the saved nonce is compared with the account's confirmed (`latest`) nonce. If the confirmed nonce is above it, the transaction was mined: the record is cleared and `NonceConsumed` is returned (callers already handle it; the dispatcher has no dedicated arm, so such a task is retried on the next poll). If the confirmed nonce cannot be read, the hold is kept.
 
 ## Task Types
 
@@ -88,6 +101,7 @@ On startup, indexer initializes from `now - sync_lookback_secs`. The lookback is
 ### General Errors
 - **RPC failures during indexing**: logged, retry next poll
 - **Task failures**: task stays in queue, retried next poll
+- **Any `ExecuteRelay` error other than `PendingReplacement` and `RootNotConfirmed`**: rescheduled +30min and logged (route, epoch, error text); not dropped. `RootNotConfirmed` is rescheduled +1h.
 - **`Insufficient funds` on Challenge**: rescheduled +30min
 - **`Invalid claim` reverts**: rescheduled +30min (see below)
 
@@ -106,7 +120,7 @@ This prevents wasted execution attempts and keeps the task queue clean.
 
 ### Invalid Claim Rescheduling
 
-Due to the 20min finality buffer, someone can change claim state right before we execute a task. When `challenge`, `start_verification`, or `verify_snapshot` reverts with "Invalid claim" (claimHash mismatch), we reschedule +30min to give the indexer time to catch up and update ClaimStore with fresh claim data.
+Due to the 20min finality buffer, someone can change claim state right before we execute a task. When `challenge`, `start_verification`, or `verify_snapshot` reverts with "Invalid claim" (claimHash mismatch), we reschedule +30min to give the indexer time to catch up and update ClaimStore with fresh claim data. The task is kept in the store and retried (see TaskDispatcher).
 
 ### Race Conditions
 
@@ -126,11 +140,12 @@ Each task has its own way of detecting and handling race conditions (another val
 | `start_verification` | on revert: `VerificationStarted` event emitted | drop task |
 | `start_verification` | on revert: `Challenged` event emitted | drop task |
 | `verify_snapshot` | `challenger != 0` | drop task |
+| `verify_snapshot` | claim state root != `inbox.snapshots(epoch)` (read as `validate_claim` does; zero counts as a mismatch) | log and drop task, never send (F3) |
 | `verify_snapshot` | on revert: `Verified` event emitted | drop task |
 | `verify_snapshot` | on revert: `Challenged` event emitted | drop task |
 | `execute_relay` | `isSpent(position) == true` | drop task |
 | `execute_relay` | `roots(root) == 0` | reschedule +1hr |
-| `execute_relay` | any revert | drop task (unreliable error messages from Arbitrum outbox) |
+| `execute_relay` | any other error / revert | reschedule +30min and log the error (Arbitrum outbox error messages are unreliable, so the cause is logged, not matched) |
 | `withdraw_deposit` | `claimHashes[epoch] == 0` (pre-check) | drop task |
 | `withdraw_deposit` | on revert: `claimHashes[epoch] == 0` | drop task |
 

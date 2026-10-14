@@ -9,6 +9,20 @@ use crate::tasks::{Task, TaskKind, TaskStore, ClaimStore};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Post-execution store action: only a finished task leaves the store.
+/// A rescheduled task reports `false` and keeps its new `execute_after`.
+fn settle(store: &Mutex<TaskStore>, task: &Task, done: bool) {
+    if done {
+        store.lock().unwrap().remove_task(task);
+    }
+}
+
+/// Push the task to a later time and report it as not done, so it is not removed.
+fn reschedule_and_keep(store: &Mutex<TaskStore>, task: &Task, execute_after: u64) -> bool {
+    store.lock().unwrap().reschedule_task(task, execute_after);
+    false
+}
+
 pub struct TaskDispatcher {
     config: ValidatorConfig,
     route: Route,
@@ -71,8 +85,8 @@ impl TaskDispatcher {
             let success = self.execute_task(&task, now).await;
             if success {
                 info!(logger = "Dispatcher", route = self.route.name, task = task.kind.name(), epoch = task.epoch, "Completed task");
-                self.task_store.lock().unwrap().remove_task(&task);
             }
+            settle(&self.task_store, &task, success);
         }
     }
 
@@ -104,8 +118,7 @@ impl TaskDispatcher {
                 ).await {
                     Ok(_) => true,
                     Err(e) if e.to_string() == "EpochNotFinalized" => {
-                        self.task_store.lock().unwrap().reschedule_task(task, current_timestamp + 30 * 60);
-                        true
+                        reschedule_and_keep(&self.task_store, task, current_timestamp + 30 * 60)
                     }
                     Err(_) => false,
                 }
@@ -116,16 +129,13 @@ impl TaskDispatcher {
                     // In flight: keep the task as-is so the next cycle replaces it.
                     Err(e) if e.to_string() == "PendingReplacement" => false,
                     Err(e) if e.to_string() == "Insufficient funds" => {
-                        self.task_store.lock().unwrap().reschedule_task(task, current_timestamp + 30 * 60);
-                        true
+                        reschedule_and_keep(&self.task_store, task, current_timestamp + 30 * 60)
                     }
                     Err(e) if e.to_string() == "VerificationStarted" => {
-                        self.task_store.lock().unwrap().reschedule_task(task, current_timestamp + 20 * 60);
-                        true
+                        reschedule_and_keep(&self.task_store, task, current_timestamp + 20 * 60)
                     }
                     Err(e) if e.to_string().contains("Invalid claim") => {
-                        self.task_store.lock().unwrap().reschedule_task(task, current_timestamp + 30 * 60);
-                        true
+                        reschedule_and_keep(&self.task_store, task, current_timestamp + 30 * 60)
                     }
                     Err(_) => false,
                 }
@@ -138,8 +148,7 @@ impl TaskDispatcher {
                     Ok(_) => true,
                     Err(e) if e.to_string() == "PendingReplacement" => false,
                     Err(e) if e.to_string().contains("Invalid claim") => {
-                        self.task_store.lock().unwrap().reschedule_task(task, current_timestamp + 30 * 60);
-                        true
+                        reschedule_and_keep(&self.task_store, task, current_timestamp + 30 * 60)
                     }
                     Err(_) => false,
                 }
@@ -149,8 +158,7 @@ impl TaskDispatcher {
                     Ok(_) => true,
                     Err(e) if e.to_string() == "PendingReplacement" => false,
                     Err(e) if e.to_string().contains("Invalid claim") => {
-                        self.task_store.lock().unwrap().reschedule_task(task, current_timestamp + 30 * 60);
-                        true
+                        reschedule_and_keep(&self.task_store, task, current_timestamp + 30 * 60)
                     }
                     Err(_) => false,
                 }
@@ -175,12 +183,11 @@ impl TaskDispatcher {
                     // pushed 30 minutes into the future instead of being replaced.
                     Err(e) if e.to_string() == "PendingReplacement" => false,
                     Err(e) if e.to_string() == "RootNotConfirmed" => {
-                        self.task_store.lock().unwrap().reschedule_task(task, current_timestamp + 60 * 60);
-                        true
+                        reschedule_and_keep(&self.task_store, task, current_timestamp + 60 * 60)
                     }
-                    Err(_) => {
-                        self.task_store.lock().unwrap().reschedule_task(task, current_timestamp + 30 * 60);
-                        true
+                    Err(e) => {
+                        warn!(logger = "Dispatcher", route = self.route.name, task = task.kind.name(), epoch, error = %e, "ExecuteRelay failed, rescheduling in 30 minutes");
+                        reschedule_and_keep(&self.task_store, task, current_timestamp + 30 * 60)
                     }
                 }
             }
@@ -188,5 +195,63 @@ impl TaskDispatcher {
                 tasks::withdraw_deposit::execute(&self.route, epoch, &self.claim_store).await.is_ok()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, Mutex<TaskStore>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("route.json"));
+        (dir, Mutex::new(store))
+    }
+
+    fn task(epoch: u64, kind: TaskKind, execute_after: u64) -> Task {
+        Task { epoch, execute_after, kind }
+    }
+
+    #[test]
+    fn rescheduled_task_stays_with_new_execute_after() {
+        let (_dir, store) = store();
+        let t = task(7, TaskKind::ValidateClaim, 100);
+        store.lock().unwrap().add_task(t.clone());
+
+        let done = reschedule_and_keep(&store, &t, 1900);
+        settle(&store, &t, done);
+
+        let tasks = store.lock().unwrap().load().tasks;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].epoch, 7);
+        assert_eq!(tasks[0].execute_after, 1900);
+    }
+
+    #[test]
+    fn completed_task_is_removed() {
+        let (_dir, store) = store();
+        let t = task(7, TaskKind::ValidateClaim, 100);
+        let other = task(8, TaskKind::ValidateClaim, 100);
+        store.lock().unwrap().add_task(t.clone());
+        store.lock().unwrap().add_task(other);
+
+        settle(&store, &t, true);
+
+        let tasks = store.lock().unwrap().load().tasks;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].epoch, 8);
+    }
+
+    #[test]
+    fn unfinished_task_without_reschedule_is_untouched() {
+        let (_dir, store) = store();
+        let t = task(7, TaskKind::Challenge, 100);
+        store.lock().unwrap().add_task(t.clone());
+
+        settle(&store, &t, false);
+
+        let tasks = store.lock().unwrap().load().tasks;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].execute_after, 100);
     }
 }

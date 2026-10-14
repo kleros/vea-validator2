@@ -62,7 +62,7 @@ pub async fn execute(
         if e.to_string() == "PendingReplacement" {
             return result;
         }
-        error!(logger = "ExecuteRelay", route = route.name, "Execution failed: {e}");
+        error!(logger = "ExecuteRelay", route = route.name, epoch, "Execution failed: {e}");
         return Err("ExecutionFailed".into());
     }
     result
