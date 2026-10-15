@@ -8,7 +8,7 @@ use tokio::time::{sleep, Duration};
 use tracing::{info, warn, error};
 
 use crate::config::Route;
-use crate::contracts::{IVeaInbox, IArbSys};
+use crate::contracts::{IVeaOutbox, IArbSys};
 use crate::tasks::{Task, TaskKind, TaskStore, ClaimStore, ClaimData};
 use crate::{find_block_by_timestamp, find_block_by_timestamp_from};
 
@@ -23,15 +23,21 @@ const CATCHUP_SLEEP: Duration = Duration::from_secs(1);
 const IDLE_SLEEP: Duration = Duration::from_secs(5 * 60);
 const ARB_SYS: Address = Address::new([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64]);
 
-async fn get_log_timestamp(log: &alloy::rpc::types::Log, provider: &DynProvider<Ethereum>) -> u64 {
+/// Why an event handler could not finish: an RPC error, a `null` answer for
+/// something the log proves exists (a lagging node), a state read that contradicts
+/// the log (also a lagging node), or a malformed log. `scan_chain` stops the chunk on
+/// the first one and rescans it next cycle (S13); nothing a handler does before the
+/// failing read is lost, and replaying the chunk's earlier events is idempotent.
+pub type IndexError = Box<dyn std::error::Error + Send + Sync>;
+
+async fn get_log_timestamp(log: &alloy::rpc::types::Log, provider: &DynProvider<Ethereum>) -> Result<u64, IndexError> {
     if let Some(ts) = log.block_timestamp {
-        return ts;
+        return Ok(ts);
     }
-    let block_num = log.block_number.expect("Log missing block_number");
-    let block = provider.get_block_by_number(block_num.into()).await
-        .expect("Failed to fetch block for timestamp")
-        .expect("Block not found");
-    block.header.timestamp
+    let block_num = log.block_number.ok_or("log missing block_number")?;
+    let block = provider.get_block_by_number(block_num.into()).await?
+        .ok_or_else(|| format!("block {block_num} not found (lagging node?)"))?;
+    Ok(block.header.timestamp)
 }
 
 pub struct EventIndexer {
@@ -191,9 +197,15 @@ impl EventIndexer {
         match provider.get_logs(&filter).await {
             Ok(logs) => {
                 for log in logs {
-                    match target {
+                    let handled = match target {
                         Inbox => self.dispatch_inbox_event(&log).await,
                         Outbox => self.dispatch_outbox_event(&log).await,
+                    };
+                    if let Err(e) = handled {
+                        // The cursor stays put, so the whole chunk is rescanned next
+                        // cycle; the events before this one replay idempotently (S13).
+                        warn!(logger = "Indexer", route = self.route.name, chain = label, block = log.block_number.unwrap_or(0), from_block, to_block, "Failed to process event, chunk will be rescanned: {e}");
+                        return false;
                     }
                 }
 
@@ -229,34 +241,39 @@ impl EventIndexer {
         }
     }
 
-    async fn dispatch_inbox_event(&self, log: &alloy::rpc::types::Log) {
+    async fn dispatch_inbox_event(&self, log: &alloy::rpc::types::Log) -> Result<(), IndexError> {
         let topic0 = match log.topics().first() {
             Some(t) => *t,
-            None => return,
+            None => return Ok(()),
         };
 
         if topic0 == alloy::primitives::keccak256("SnapshotSent(uint256,bytes32)") {
-            self.handle_snapshot_sent(log).await;
+            self.handle_snapshot_sent(log).await?;
         } else if topic0 == alloy::primitives::keccak256("SnapshotSaved(bytes32,uint256,uint64)") {
             self.handle_snapshot_saved(log);
         }
+        Ok(())
     }
 
-    async fn dispatch_outbox_event(&self, log: &alloy::rpc::types::Log) {
+    /// Public only so a test can drive one outbox log through the handlers with a
+    /// provider of its choosing; `scan_once` is the real entry point.
+    #[doc(hidden)]
+    pub async fn dispatch_outbox_event(&self, log: &alloy::rpc::types::Log) -> Result<(), IndexError> {
         let topic0 = match log.topics().first() {
             Some(t) => *t,
-            None => return,
+            None => return Ok(()),
         };
 
         if topic0 == alloy::primitives::keccak256("Claimed(address,uint256,bytes32)") {
-            self.handle_claimed_event(log).await;
+            self.handle_claimed_event(log).await?;
         } else if topic0 == alloy::primitives::keccak256("VerificationStarted(uint256)") {
-            self.handle_verification_started_event(log).await;
+            self.handle_verification_started_event(log).await?;
         } else if topic0 == alloy::primitives::keccak256("Challenged(uint256,address)") {
-            self.handle_challenged_event(log).await;
+            self.handle_challenged_event(log).await?;
         } else if topic0 == alloy::primitives::keccak256("Verified(uint256)") {
-            self.handle_verified_event(log).await;
+            self.handle_verified_event(log).await?;
         }
+        Ok(())
     }
 
     fn handle_snapshot_saved(&self, log: &alloy::rpc::types::Log) {
@@ -268,31 +285,31 @@ impl EventIndexer {
         info!(logger = "Indexer", route = self.route.name, count, "SnapshotSaved");
     }
 
-    async fn handle_snapshot_sent(&self, log: &alloy::rpc::types::Log) {
+    async fn handle_snapshot_sent(&self, log: &alloy::rpc::types::Log) -> Result<(), IndexError> {
         let epoch = match self.parse_epoch_from_snapshot_sent(log) {
             Some(e) => e,
-            None => return,
+            None => return Ok(()),
         };
 
         let state = self.task_store.lock().unwrap().load();
         if state.tasks.iter().any(|t| t.epoch == epoch && matches!(t.kind, TaskKind::ExecuteRelay { .. })) {
-            return;
+            return Ok(());
         }
 
         let tx_hash = match log.transaction_hash {
             Some(h) => h,
-            None => return,
+            None => return Ok(()),
         };
 
-        let tx = self.route.inbox_provider.get_transaction_by_hash(tx_hash).await
-            .expect("Failed to get transaction")
-            .expect("Transaction not found");
+        // The log proves the tx exists: `null` here is a node that has not got it yet.
+        let tx = self.route.inbox_provider.get_transaction_by_hash(tx_hash).await?
+            .ok_or_else(|| format!("transaction {tx_hash:#x} not found (lagging node?)"))?;
         if tx.inner.signer() != self.wallet_address {
             info!(logger = "Indexer", route = self.route.name, epoch, "SnapshotSent not from validator, skipping");
-            return;
+            return Ok(());
         }
 
-        match self.fetch_l2_to_l1_from_tx(tx_hash, epoch).await {
+        match self.fetch_l2_to_l1_from_tx(tx_hash, epoch).await? {
             Some(task) => {
                 info!(logger = "Indexer", route = self.route.name, epoch, position = %format!("{:#x}", task.2), "Found SnapshotSent");
                 self.task_store.lock().unwrap().add_task(Task {
@@ -314,11 +331,12 @@ impl EventIndexer {
                 error!(logger = "Indexer", route = self.route.name, tx = ?tx_hash, "No L2ToL1Tx found in tx");
             }
         }
+        Ok(())
     }
 
-    async fn handle_claimed_event(&self, log: &alloy::rpc::types::Log) {
+    async fn handle_claimed_event(&self, log: &alloy::rpc::types::Log) -> Result<(), IndexError> {
         if log.topics().len() < 3 {
-            return;
+            return Ok(());
         }
 
         let claimer = Address::from_slice(&log.topics()[1].0[12..]);
@@ -326,16 +344,29 @@ impl EventIndexer {
         info!(logger = "Indexer", route = self.route.name, epoch, block = log.block_number.unwrap_or(0), "Claimed event");
 
         if log.data().data.len() < 32 {
-            return;
+            return Ok(());
         }
         let state_root = FixedBytes::<32>::from_slice(&log.data().data[0..32]);
 
-        let block_ts = get_log_timestamp(log, &self.route.outbox_provider).await;
+        let block_ts = get_log_timestamp(log, &self.route.outbox_provider).await?;
         let timestamp_claimed = block_ts as u32;
 
-        let state = self.task_store.lock().unwrap().load();
-        if state.tasks.iter().any(|t| t.epoch == epoch) {
-            return;
+        // Dedup on the claim: a crash between `store()` and `add_task()` replays this log.
+        if self.claim_store.lock().unwrap().exists(epoch) {
+            let has_task = self.task_store.lock().unwrap().load().tasks.iter().any(|t| t.epoch == epoch);
+            let claim = self.claim_store.lock().unwrap().get(epoch);
+            let moved_on = claim.timestamp_verification != 0
+                || claim.challenger != Address::ZERO
+                || claim.honest != "None";
+            if !has_task && !moved_on {
+                info!(logger = "Indexer", route = self.route.name, epoch, "Claim exists without a task, re-adding ValidateClaim");
+                self.task_store.lock().unwrap().add_task(Task {
+                    epoch,
+                    execute_after: block_ts,
+                    kind: TaskKind::ValidateClaim,
+                });
+            }
+            return Ok(());
         }
 
         self.claim_store.lock().unwrap().store(ClaimData {
@@ -354,30 +385,23 @@ impl EventIndexer {
             execute_after: block_ts,
             kind: TaskKind::ValidateClaim,
         });
+        Ok(())
     }
 
-    async fn handle_verification_started_event(&self, log: &alloy::rpc::types::Log) {
+    async fn handle_verification_started_event(&self, log: &alloy::rpc::types::Log) -> Result<(), IndexError> {
         if log.topics().len() < 2 {
-            return;
+            return Ok(());
         }
 
         let epoch = U256::from_be_bytes(log.topics()[1].0).to::<u64>();
         info!(logger = "Indexer", route = self.route.name, epoch, block = log.block_number.unwrap_or(0), "VerificationStarted event");
 
-        if !self.claim_store.lock().unwrap().exists(epoch) {
-            let block_ts = get_log_timestamp(log, &self.route.outbox_provider).await;
-            let state = self.task_store.lock().unwrap().load();
-            let grace_end = state.indexing_since.unwrap_or(0) + self.route.settings.sync_lookback_secs;
-
-            if block_ts < grace_end {
-                info!(logger = "Indexer", route = self.route.name, epoch, "Dropping VerificationStarted - claim outside sync window");
-                return;
-            }
-            panic!("[{}] VerificationStarted for epoch {} but claim not found - this is a bug", self.route.name, epoch);
+        if !self.ensure_claim_known(epoch, log).await? {
+            return Ok(());
         }
 
-        let block_ts = get_log_timestamp(log, &self.route.outbox_provider).await as u32;
-        let block_num = log.block_number.expect("Log missing block_number") as u32;
+        let block_ts = get_log_timestamp(log, &self.route.outbox_provider).await? as u32;
+        let block_num = log.block_number.ok_or("log missing block_number")? as u32;
 
         self.claim_store.lock().unwrap().update(epoch, |c| {
             c.timestamp_verification = block_ts;
@@ -393,87 +417,228 @@ impl EventIndexer {
             execute_after,
             kind: TaskKind::VerifySnapshot,
         });
+        Ok(())
     }
 
-    async fn handle_challenged_event(&self, log: &alloy::rpc::types::Log) {
+    async fn handle_challenged_event(&self, log: &alloy::rpc::types::Log) -> Result<(), IndexError> {
         if log.topics().len() < 3 {
-            return;
+            return Ok(());
         }
 
         let epoch = U256::from_be_bytes(log.topics()[1].0).to::<u64>();
         let challenger = Address::from_slice(&log.topics()[2].0[12..]);
         info!(logger = "Indexer", route = self.route.name, epoch, block = log.block_number.unwrap_or(0), "Challenged event");
 
-        if !self.claim_store.lock().unwrap().exists(epoch) {
-            let block_ts = get_log_timestamp(log, &self.route.outbox_provider).await;
-            let state = self.task_store.lock().unwrap().load();
-            let grace_end = state.indexing_since.unwrap_or(0) + self.route.settings.sync_lookback_secs;
-
-            if block_ts < grace_end {
-                info!(logger = "Indexer", route = self.route.name, epoch, "Dropping Challenged - claim outside sync window");
-                return;
-            }
-            panic!("[{}] Challenged for epoch {} but claim not found - this is a bug", self.route.name, epoch);
+        if !self.ensure_claim_known(epoch, log).await? {
+            return Ok(());
         }
 
-        self.claim_store.lock().unwrap().update(epoch, |c| {
-            c.challenger = challenger;
-        });
+        // Already handled: a chunk rescan (S13) replays this log, and the SendSnapshot it
+        // scheduled may have run in between; task dedup alone would re-add it and send
+        // the snapshot twice. The challenger is written last, so a crash between the
+        // two writes still replays into the scheduling below.
+        if self.claim_store.lock().unwrap().get(epoch).challenger == challenger {
+            return Ok(());
+        }
 
         self.task_store.lock().unwrap().invalidate_tasks(epoch, &["ValidateClaim", "Challenge", "StartVerification", "VerifySnapshot"]);
 
-        let block_ts = get_log_timestamp(log, &self.route.outbox_provider).await;
+        let block_ts = get_log_timestamp(log, &self.route.outbox_provider).await?;
         self.task_store.lock().unwrap().add_task(Task {
             epoch,
             execute_after: block_ts,
             kind: TaskKind::SendSnapshot,
         });
+
+        self.claim_store.lock().unwrap().update(epoch, |c| {
+            c.challenger = challenger;
+        });
+        Ok(())
     }
 
-    async fn handle_verified_event(&self, log: &alloy::rpc::types::Log) {
+    async fn handle_verified_event(&self, log: &alloy::rpc::types::Log) -> Result<(), IndexError> {
         let epoch = if log.topics().len() >= 2 {
             U256::from_be_bytes(log.topics()[1].0).to::<u64>()
         } else if log.data().data.len() >= 32 {
             U256::from_be_slice(&log.data().data[0..32]).to::<u64>()
         } else {
-            return;
+            return Ok(());
         };
         info!(logger = "Indexer", route = self.route.name, epoch, block = log.block_number.unwrap_or(0), "Verified event");
 
-        let block_ts = get_log_timestamp(log, &self.route.outbox_provider).await;
+        let block_ts = get_log_timestamp(log, &self.route.outbox_provider).await?;
 
-        if !self.claim_store.lock().unwrap().exists(epoch) {
-            let state = self.task_store.lock().unwrap().load();
-            let grace_end = state.indexing_since.unwrap_or(0) + self.route.settings.sync_lookback_secs;
-
-            if block_ts < grace_end {
-                info!(logger = "Indexer", route = self.route.name, epoch, "Dropping Verified - claim outside sync window");
-                return;
-            }
-            panic!("[{}] Verified for epoch {} but claim not found - this is a bug", self.route.name, epoch);
+        if !self.ensure_claim_known(epoch, log).await? {
+            return Ok(());
         }
 
+        // The resolution is in, one way or another: the dispute path is over.
+        self.task_store.lock().unwrap().invalidate_tasks(epoch, &["SendSnapshot", "ExecuteRelay"]);
+
+        // The state read below is at `latest`; a node whose head is still before this
+        // log would answer with the pre-resolution hash, which for an unchallenged claim
+        // is indistinguishable from the real `None` outcome. Refuse such a node here so
+        // the chunk is rescanned instead (partial: the two requests may hit different
+        // transports of a fallback set).
+        let head = self.route.outbox_provider.get_block_number().await?;
+        let log_block = log.block_number.ok_or("log missing block_number")?;
+        if head < log_block {
+            return Err(format!("outbox RPC head {head} is before the Verified log's block {log_block} (lagging node?)").into());
+        }
+
+        // `honest` is read back from the chain, not guessed from the inbox root (S10).
+        // `verifySnapshot` writes Claimer whatever the root; `resolveDisputedClaim`
+        // writes Claimer when the bridged root matches the claim, Challenger when it
+        // does not and the claim was challenged, and leaves None for an unchallenged
+        // claim with a wrong root. The log does not tell the paths apart, but the hash
+        // the outbox stores does: the stored struct must hash to it, or every later
+        // call with it reverts "Invalid claim.".
         let claim = self.claim_store.lock().unwrap().get(epoch);
-
-        let real_state_root = self.get_inbox_snapshot(epoch).await;
-
-        let honest = if claim.state_root == real_state_root {
-            "Claimer"
-        } else {
-            "Challenger"
+        let outbox = IVeaOutbox::new(self.route.outbox_address, self.route.outbox_provider.clone());
+        let claim_hash = outbox.claimHashes(U256::from(epoch)).call().await?;
+        let honest = match claim.honest_party(claim_hash) {
+            Some(h) => h,
+            None if claim_hash == FixedBytes::<32>::ZERO => {
+                info!(logger = "Indexer", route = self.route.name, epoch, "Claim already withdrawn");
+                // Resolved and paid out: the claim-bound tasks are obsolete, and once the
+                // claim is removed they would panic on the missing claim (a resync over
+                // an already withdrawn claim leaves ValidateClaim/VerifySnapshot behind).
+                self.task_store.lock().unwrap().invalidate_tasks(epoch, &["ValidateClaim", "Challenge", "StartVerification", "VerifySnapshot"]);
+                self.claim_store.lock().unwrap().remove(epoch);
+                return Ok(());
+            }
+            None => {
+                error!(logger = "Indexer", route = self.route.name, epoch, claim_hash = ?claim_hash, "Stored claim hashes to the on-chain claim for no honest party, not withdrawing");
+                return Ok(());
+            }
         };
-
+        if honest == "None" && claim.challenger != Address::ZERO {
+            // Only an unchallenged claim can be resolved and still have no honest party
+            // (a challenged one is Claimer or Challenger after Verified), so for a
+            // challenged claim this is a stale state read from a lagging node: fail the
+            // chunk and rescan, as for any other indexer RPC failure, instead of losing
+            // the challenger's withdrawal. Checked before the store is touched: on a
+            // rescan of an already handled event the stale hash would otherwise
+            // overwrite the stored Challenger with None, and the dispatcher drops a
+            // WithdrawDeposit task that finds honest == None.
+            return Err(format!("claimHashes[{epoch}] still hashes with honest = None after Verified of a challenged claim: stale RPC state").into());
+        }
         self.claim_store.lock().unwrap().update(epoch, |c| {
             c.honest = honest.to_string();
         });
 
-        self.task_store.lock().unwrap().invalidate_tasks(epoch, &["ValidateClaim", "Challenge", "StartVerification", "VerifySnapshot", "ExecuteRelay"]);
-
+        if honest == "None" {
+            // Neither withdrawal applies, and the claim is still live: the outbox still
+            // accepts `challenge` (challenger == 0, honest == None) and the claimer can
+            // still start and pass verification. Its root is wrong (a matching root
+            // would have made it Claimer), so it must still be validated and challenged:
+            // keep those tasks, and re-add ValidateClaim if neither is pending.
+            warn!(logger = "Indexer", route = self.route.name, epoch, "Verified without an honest party (unchallenged claim with a wrong root resolved through the bridge), nothing to withdraw; claim stays challengeable");
+            let pending = self.task_store.lock().unwrap().load().tasks.iter()
+                .any(|t| t.epoch == epoch && matches!(t.kind, TaskKind::ValidateClaim | TaskKind::Challenge));
+            if !pending {
+                self.task_store.lock().unwrap().add_task(Task {
+                    epoch,
+                    execute_after: block_ts,
+                    kind: TaskKind::ValidateClaim,
+                });
+            }
+            return Ok(());
+        }
+        self.task_store.lock().unwrap().invalidate_tasks(epoch, &["ValidateClaim", "Challenge", "StartVerification", "VerifySnapshot"]);
         self.task_store.lock().unwrap().add_task(Task {
             epoch,
             execute_after: block_ts,
             kind: TaskKind::WithdrawDeposit,
         });
+        Ok(())
+    }
+
+    /// Make sure the claim behind an outbox event for `epoch` is in the `ClaimStore`.
+    ///
+    /// A claim made before the sync window was never seen, yet its later events can
+    /// arrive at any time: `startVerification` and `verifySnapshot` have no deadline.
+    /// Dropping such an event would leave a dishonest claim unvalidated, and treating it
+    /// as impossible (a panic) stalls the route for good, since the cursor never moves
+    /// past the log. Instead the claim is rebuilt from the chain (see
+    /// [`Self::backfill_claim`]). Returns false, after logging, only when no `Claimed`
+    /// log exists for the epoch, in which case the event is dropped.
+    async fn ensure_claim_known(&self, epoch: u64, log: &alloy::rpc::types::Log) -> Result<bool, IndexError> {
+        if self.claim_store.lock().unwrap().exists(epoch) {
+            return Ok(true);
+        }
+        let before_block = log.block_number.ok_or("log missing block_number")?;
+        if self.backfill_claim(epoch, before_block).await? {
+            return Ok(true);
+        }
+        warn!(logger = "Indexer", route = self.route.name, epoch, block = before_block, "No Claimed event found for epoch, dropping event");
+        Ok(false)
+    }
+
+    /// Rebuild a claim from its `Claimed` log and replay the epoch's later
+    /// `VerificationStarted`/`Challenged` logs that precede `before_block`, so the
+    /// stored claim hashes to what the outbox holds.
+    ///
+    /// The outbox only accepts a claim for `epoch` while its own clock is in
+    /// `epoch + 1`, so the `Claimed` log lies in a one-epoch window of outbox blocks.
+    /// All logs are fetched before anything is stored, so an RPC failure (an error,
+    /// like the indexer's other RPC failures; the chunk is rescanned next cycle)
+    /// cannot leave a half-built claim behind.
+    async fn backfill_claim(&self, epoch: u64, before_block: u64) -> Result<bool, IndexError> {
+        let provider = &self.route.outbox_provider;
+        let outbox = IVeaOutbox::new(self.route.outbox_address, provider.clone());
+        let epoch_period = outbox.epochPeriod().call().await?.to::<u64>();
+
+        let window_start = find_block_by_timestamp(provider, (epoch + 1) * epoch_period).await;
+        let window_end = find_block_by_timestamp(provider, (epoch + 2) * epoch_period).await.min(before_block);
+        let claimed = Filter::new()
+            .address(self.route.outbox_address)
+            .event_signature(alloy::primitives::keccak256("Claimed(address,uint256,bytes32)"))
+            .topic2(U256::from(epoch))
+            .from_block(window_start)
+            .to_block(window_end);
+        let claim_log = match provider.get_logs(&claimed).await?.into_iter().next() {
+            Some(l) => l,
+            None => return Ok(false),
+        };
+
+        let claim_block = claim_log.block_number.ok_or("log missing block_number")?;
+        let mut later = Vec::new();
+        let mut from = claim_block;
+        while from < before_block {
+            let to = min(from + CHUNK_SIZE, before_block - 1);
+            let filter = Filter::new()
+                .address(self.route.outbox_address)
+                .event_signature(vec![
+                    alloy::primitives::keccak256("VerificationStarted(uint256)"),
+                    alloy::primitives::keccak256("Challenged(uint256,address)"),
+                ])
+                .topic1(U256::from(epoch))
+                .from_block(from)
+                .to_block(to);
+            later.extend(provider.get_logs(&filter).await?);
+            from = to + 1;
+        }
+
+        info!(logger = "Indexer", route = self.route.name, epoch, claim_block, replayed = later.len(), "Backfilled claim from before the sync window");
+        let replayed: Result<(), IndexError> = async {
+            self.handle_claimed_event(&claim_log).await?;
+            for l in &later {
+                Box::pin(self.dispatch_outbox_event(l)).await?;
+            }
+            Ok(())
+        }.await;
+        if let Err(e) = replayed {
+            // The claim must not survive half-built: `ensure_claim_known` would find it
+            // on the rescan and skip the backfill, leaving the verification fields
+            // unset, so every later call with it reverts "Invalid claim.". Roll back and
+            // let the rescan rebuild it from scratch.
+            warn!(logger = "Indexer", route = self.route.name, epoch, "Backfill replay failed, rolling the claim back: {e}");
+            self.claim_store.lock().unwrap().remove(epoch);
+            self.task_store.lock().unwrap().invalidate_tasks(epoch, &["ValidateClaim", "Challenge", "SendSnapshot", "StartVerification", "VerifySnapshot", "WithdrawDeposit"]);
+            return Err(e);
+        }
+        Ok(true)
     }
 
     fn parse_epoch_from_snapshot_sent(&self, log: &alloy::rpc::types::Log) -> Option<u64> {
@@ -487,10 +652,10 @@ impl EventIndexer {
         &self,
         tx_hash: FixedBytes<32>,
         epoch: u64,
-    ) -> Option<(u64, u64, U256, Address, Address, u64, u64, u64, U256, Bytes)> {
-        let receipt = self.route.inbox_provider.get_transaction_receipt(tx_hash).await
-            .expect("Failed to get transaction receipt")
-            .expect("Transaction receipt not found");
+    ) -> Result<Option<(u64, u64, U256, Address, Address, u64, u64, u64, U256, Bytes)>, IndexError> {
+        // The log proves the tx is mined: `null` here is a node that has not got it yet.
+        let receipt = self.route.inbox_provider.get_transaction_receipt(tx_hash).await?
+            .ok_or_else(|| format!("receipt of {tx_hash:#x} not found (lagging node?)"))?;
 
         for log in receipt.inner.logs() {
             if log.address() != ARB_SYS {
@@ -502,13 +667,12 @@ impl EventIndexer {
                 Err(_) => continue,
             };
 
-            let block_number = receipt.block_number.expect("Receipt missing block_number");
-            let block_timestamp = self.route.inbox_provider.get_block_by_number(block_number.into()).await
-                .expect("Failed to get block by number")
-                .expect("Block not found")
+            let block_number = receipt.block_number.ok_or("receipt missing block_number")?;
+            let block_timestamp = self.route.inbox_provider.get_block_by_number(block_number.into()).await?
+                .ok_or_else(|| format!("block {block_number} not found (lagging node?)"))?
                 .header.timestamp;
 
-            return Some((
+            return Ok(Some((
                 epoch,
                 block_timestamp + self.route.settings.relay_delay_secs,
                 decoded.inner.position,
@@ -519,13 +683,8 @@ impl EventIndexer {
                 decoded.inner.data.timestamp.to::<u64>(),
                 decoded.inner.data.callvalue,
                 decoded.inner.data.data.clone(),
-            ));
+            )));
         }
-        None
-    }
-
-    async fn get_inbox_snapshot(&self, epoch: u64) -> FixedBytes<32> {
-        let inbox = IVeaInbox::new(self.route.inbox_address, self.route.inbox_provider.clone());
-        inbox.snapshots(U256::from(epoch)).call().await.expect("Failed to get inbox snapshot")
+        Ok(None)
     }
 }

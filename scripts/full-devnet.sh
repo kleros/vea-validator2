@@ -54,7 +54,7 @@ forge build -q
 FROM="$(cast wallet address "$PK")"
 NONCE="$(cast nonce "$FROM" --rpc-url "$ARB_RPC")"
 INBOX_PREDICTED="$(cast compute-address "$FROM" --nonce $((NONCE + 2)) \
-  | awk '/Computed Address:/ {print $3}')"
+  | grep -oE '0x[0-9a-fA-F]{40}' | tail -1)"
 
 create() {
   forge create "$1" \
@@ -81,7 +81,7 @@ ROLLUP_MOCK="$(
 
 ETH_NONCE="$(cast nonce "$FROM" --rpc-url "$ETH_RPC")"
 BRIDGE_PREDICTED="$(cast compute-address "$FROM" --nonce $((ETH_NONCE + 1)) \
-  | awk '/Computed Address:/ {print $3}')"
+  | grep -oE '0x[0-9a-fA-F]{40}' | tail -1)"
 
 OUTBOX_MOCK="$(
   create contracts/src/test/bridge-mocks/arbitrum/OutboxMock.sol:OutboxMock \
@@ -155,7 +155,7 @@ WETH_GNOSIS="$(
 # Predict Router address on Ethereum (will be deployed after inbox)
 NONCE_ETH_FOR_ROUTER="$(cast nonce "$FROM" --rpc-url "$ETH_RPC")"
 ROUTER_ARB_TO_GNOSIS_PREDICTED="$(cast compute-address "$FROM" --nonce "$NONCE_ETH_FOR_ROUTER" \
-  | awk '/Computed Address:/ {print $3}')"
+  | grep -oE '0x[0-9a-fA-F]{40}' | tail -1)"
 
 # Deploy VeaInbox for Arbitrum to Gnosis (needs router address)
 INBOX_ARB_TO_GNOSIS="$(
@@ -167,7 +167,7 @@ INBOX_ARB_TO_GNOSIS="$(
 # Predict VeaOutbox address on Gnosis
 NONCE_GNOSIS="$(cast nonce "$FROM" --rpc-url "$GNOSIS_RPC")"
 OUTBOX_ARB_TO_GNOSIS_PREDICTED="$(cast compute-address "$FROM" --nonce "$NONCE_GNOSIS" \
-  | awk '/Computed Address:/ {print $3}')"
+  | grep -oE '0x[0-9a-fA-F]{40}' | tail -1)"
 
 # Deploy Router on Mainnet
 ROUTER_ARB_TO_GNOSIS="$(

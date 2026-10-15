@@ -40,11 +40,30 @@ fn is_infra_rpc_error(code: i64, message: &str) -> bool {
 }
 
 /// Wraps an RPC transport so JSON-RPC responses matching [`is_infra_rpc_error`] are
-/// surfaced as transport errors instead of being passed through as a successful call.
+/// surfaced as transport errors instead of being passed through as a successful call,
+/// and so transport errors never carry the full URL (S5): reqwest puts it in every
+/// error, URLs commonly embed API keys, and these errors are logged verbatim.
 #[derive(Clone)]
 struct ErrorAwareTransport<S> {
     inner: S,
+    url: String,
     label: String,
+    /// Reclassify infra-level JSON-RPC errors; only meaningful behind `FallbackLayer`,
+    /// so a single transport keeps every response exactly as the node sent it.
+    reclassify: bool,
+}
+
+/// The error and its sources as one line, with every occurrence of `url` replaced by
+/// its redacted `label`. Keeps the cause ("connection refused", "timed out") visible.
+fn redact_transport_error(err: &TransportError, url: &str, label: &str) -> TransportError {
+    let mut text = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(e) = source {
+        text.push_str(": ");
+        text.push_str(&e.to_string());
+        source = e.source();
+    }
+    TransportErrorKind::custom_str(&text.replace(url, label))
 }
 
 impl<S> Service<RequestPacket> for ErrorAwareTransport<S>
@@ -64,10 +83,15 @@ where
 
     fn call(&mut self, req: RequestPacket) -> Self::Future {
         let label = self.label.clone();
+        let url = self.url.clone();
+        let reclassify = self.reclassify;
         let fut = self.inner.call(req);
         Box::pin(async move {
-            let response = fut.await?;
+            let response = fut.await.map_err(|e| redact_transport_error(&e, &url, &label))?;
 
+            if !reclassify {
+                return Ok(response);
+            }
             let infra_error = match &response {
                 ResponsePacket::Single(r) => match &r.payload {
                     ResponsePayload::Failure(e) if is_infra_rpc_error(e.code, &e.message) => {
@@ -178,7 +202,12 @@ fn build_provider_from_urls(urls: &[String], wallet: &EthereumWallet) -> DynProv
     let http_client = build_http_client();
 
     if urls.len() == 1 {
-        let transport = Http::with_client(http_client, urls[0].parse().expect("Invalid RPC URL"));
+        let transport = ErrorAwareTransport {
+            inner: Http::with_client(http_client, urls[0].parse().expect("Invalid RPC URL")),
+            url: urls[0].clone(),
+            label: redact_url(&urls[0]),
+            reclassify: false,
+        };
         let client = RpcClient::builder().transport(transport, false);
         return DynProvider::new(
             ProviderBuilder::new()
@@ -193,7 +222,9 @@ fn build_provider_from_urls(urls: &[String], wallet: &EthereumWallet) -> DynProv
     let transports: Vec<_> = urls.iter()
         .map(|url| ErrorAwareTransport {
             inner: Http::with_client(http_client.clone(), url.parse().expect("Invalid RPC URL")),
+            url: url.clone(),
             label: redact_url(url),
+            reclassify: true,
         })
         .collect();
 
@@ -344,5 +375,27 @@ impl ValidatorConfig {
             ethereum_provider,
             make_claims,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::providers::Provider;
+    use alloy::signers::local::PrivateKeySigner;
+
+    /// S5: transport errors must not carry the RPC URL, which commonly embeds an API key
+    /// in its path or query; these errors are logged verbatim all over the validator.
+    #[tokio::test]
+    async fn transport_errors_do_not_leak_rpc_url_secrets() {
+        let wallet = EthereumWallet::from(PrivateKeySigner::random());
+        let secret = "SECRET-api-key-0123456789";
+        let urls = [format!("http://127.0.0.1:1/v2/{secret}?apikey={secret}")];
+        for urls in [&urls[..], &[urls[0].clone(), format!("http://127.0.0.1:2/{secret}")][..]] {
+            let provider = build_provider_from_urls(urls, &wallet);
+            let err = provider.get_block_number().await.expect_err("nothing listens on these ports");
+            let shown = format!("{err} / {err:?}");
+            assert!(!shown.contains(secret), "RPC secret leaked into error text: {shown}");
+        }
     }
 }
